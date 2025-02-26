@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -42,6 +43,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	log.SetOutput(io.Discard)
 	workerID := initWorker()
 
 	for !CheckDone() {
@@ -51,10 +53,11 @@ func Worker(mapf func(string, string) []KeyValue,
 			log.Printf("no task")
 			time.Sleep(time.Duration(1) * time.Second)
 		} else {
-			log.Printf("handle task")
 			handleTask(task, mapf, reducef)
 		}
 	}
+
+	log.Printf("recv end signal")
 }
 
 func initWorker() int {
@@ -81,29 +84,28 @@ func getTask(workerID int) GetTaskReply {
 func handleTask(task GetTaskReply, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	if task.TaskType == Map {
+
+		// init meta data
 		nReduce := task.MapTask.NReduce
+		task_filename := task.MapTask.FileName
 		workerID := task.WorkerID
-		base_filename := fmt.Sprintf("mr-inter-%d", workerID)
-		file_list := make([]*os.File, nReduce)
+
+		// init output file
+		output_base_filename := fmt.Sprintf("mr-%s-%d", filepath.Base(task_filename), workerID)
+		output_file_list := make([]*os.File, nReduce)
 		to_write_list := make([][]KeyValue2, nReduce)
+
 		for i := range nReduce {
-			filename := fmt.Sprintf("%s-%d", base_filename, i)
-			file, err := os.Create(filename)
-			if err != nil {
-				log.Printf("open file %s failed", filename)
-			}
-
-			file_list[i] = file
+			filename := fmt.Sprintf("%s-%d", output_base_filename, i)
+			file := create_file(filename)
+			output_file_list[i] = file
 		}
 
-		file, err := os.Open(task.MapTask.FileName)
-		if err != nil {
-			log.Fatalf("can't open %s", task.MapTask.FileName)
-		}
-		content, err := io.ReadAll(file)
-		content_str := string(content)
+		// read target file
+		content := get_file_content(task_filename)
 
-		intermediate := mapf(task.MapTask.FileName, content_str)
+		// get intermediate
+		intermediate := mapf(task.MapTask.FileName, content)
 		sort.Sort(ByKey(intermediate))
 		i := 0
 		for i < len(intermediate) {
@@ -120,12 +122,65 @@ func handleTask(task GetTaskReply, mapf func(string, string) []KeyValue,
 			i = j
 		}
 
+		// write intermediate
 		for i := range nReduce {
 			jsonData, _ := json.MarshalIndent(to_write_list[i], "", "  ")
-			file_list[i].Write(jsonData)
+			output_file_list[i].Write(jsonData)
+			output_file_list[i].Close()
 		}
-		args := FinishTaskArgs{TaskType: Map, TaskFilename: task.MapTask.FileName}
+
+		// inform finish
+		args := FinishTaskArgs{TaskType: Map, TaskFilename: task_filename, ResBaseFilename: output_base_filename}
 		reply := FinishTaskReply{}
+		call("Coordinator.FinishTask", &args, &reply)
+	} else if task.TaskType == Reduce {
+
+		//nReduce := task.ReduceTask.NReduce
+		task_ID := task.ReduceTask.TaskID
+		//workerID := task.WorkerID
+
+		combined_res := make(map[string][]string)
+		reduce_res := make([]KeyValue, 0)
+
+		for _, base_filename := range task.ReduceTask.FileList {
+			filename := fmt.Sprintf("%s-%d", base_filename, task_ID)
+			contents := get_file_content(filename)
+
+			var arr_kv2 []KeyValue2
+			err := json.Unmarshal([]byte(contents), &arr_kv2)
+
+			if err != nil {
+				log.Printf("can't unamrshal %s", filename)
+			}
+
+			for _, kv := range arr_kv2 {
+				_, exist := combined_res[kv.Key]
+				if !exist {
+					combined_res[kv.Key] = kv.Values
+				} else {
+					combined_res[kv.Key] = append(combined_res[kv.Key], kv.Values...)
+				}
+			}
+		}
+
+		for key, value := range combined_res {
+			res := reducef(key, value)
+			reduce_res = append(reduce_res, KeyValue{Key: key, Value: res})
+		}
+
+		sort.Sort(ByKey(reduce_res))
+
+		filename := fmt.Sprintf("mr-out-%d", task_ID)
+		file := create_file(filename)
+		defer file.Close()
+
+		for _, kv := range reduce_res {
+			fmt.Fprintf(file, "%v %v\n", kv.Key, kv.Value)
+		}
+
+		args := FinishTaskArgs{TaskID: task_ID, TaskType: Reduce}
+		reply := FinishTaskReply{}
+
 		call("Coordinator.FinishTask", &args, &reply)
 	}
 }
@@ -137,33 +192,6 @@ func CheckDone() bool {
 	ok := call("Coordinator.CheckDone", &args, &reply)
 
 	return ok && reply.IsDone
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
 }
 
 // send an RPC request to the coordinator, wait for the response.
@@ -185,4 +213,33 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func create_file(filename string) *os.File {
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Fatalf("can't create %s", filename)
+	}
+
+	return file
+}
+
+func get_file(filename string) *os.File {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("can't open %s", filename)
+	}
+
+	return file
+}
+
+func get_file_content(filename string) string {
+	file := get_file(filename)
+	// defer file.Close()
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("can't read %s", filename)
+	}
+
+	return string(contents)
 }
