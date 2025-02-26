@@ -3,7 +3,6 @@ package mr
 import (
 	"container/list"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,7 +15,6 @@ import (
 type Coordinator struct {
 	// Your definitions here.
 	MapTaskStatus    map[string]TaskStatus
-	MapTaskContent   map[string]string
 	MapTaskList      list.List
 	MapTaskRes       map[string][]string
 	ReduceTaskStatus []TaskStatus
@@ -36,7 +34,6 @@ type Coordinator struct {
 
 func (c *Coordinator) print() {
 	fmt.Println("MapTaskMap:", c.MapTaskStatus)
-	// fmt.Println("MapTaskContent:", c.MapTaskContent)
 	fmt.Println("MapTaskList:")
 	for e := c.MapTaskList.Front(); e != nil; e = e.Next() {
 		fmt.Println("  ", e.Value)
@@ -76,11 +73,12 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		reply.TaskType = Map
 		reply.MapTask.NReduce = c.nReduce
 		reply.MapTask.FileName = filename
-		reply.MapTask.Contents = c.MapTaskContent[filename]
 
+		c.Mu.Lock()
 		c.MapTaskStatus[filename] = Assigned
-
 		c.MapTaskList.Remove(task_elm)
+		c.Mu.Unlock()
+
 		log.Printf("map task send")
 		log.Printf("nReduce: %d", reply.MapTask.NReduce)
 
@@ -95,6 +93,10 @@ func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 				log.Printf("%s time out, reassign", filename)
 			}
 		}()
+	}
+
+	if c.mapDone {
+
 	}
 
 	return nil
@@ -177,7 +179,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		MapTaskStatus:    make(map[string]TaskStatus),
 		MapTaskRes:       make(map[string][]string),
-		MapTaskContent:   make(map[string]string),
 		ReduceTaskStatus: make([]TaskStatus, 0),
 		mapDone:          false,
 		reduceDone:       false,
@@ -189,19 +190,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	for _, file := range files {
 		c.MapTaskStatus[file] = Todo
-		f, err := os.Open(file)
-		if err != nil {
-			log.Fatalf("cannot open %v: %v", file, err)
-		}
-		defer f.Close()
-
-		content, err := io.ReadAll(f)
-		if err != nil {
-			log.Fatalf("cannot read %v: %v", file, err)
-		}
-		c.MapTaskContent[file] = string(content)
 	}
-	for file := range c.MapTaskContent {
+	for file := range c.MapTaskStatus {
 		c.MapTaskList.PushBack(file)
 	}
 	c.print()

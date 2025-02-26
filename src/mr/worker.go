@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
@@ -74,10 +75,6 @@ func getTask(workerID int) GetTaskReply {
 	reply := GetTaskReply{TaskType: None, WorkerID: workerID}
 
 	call("Coordinator.GetTask", &args, &reply)
-
-	log.Printf("get nReduce: %d", reply.MapTask.NReduce)
-	log.Printf("get filename: %s", reply.MapTask.FileName)
-	log.Print(reply.MapTask.Contents)
 	return reply
 }
 
@@ -99,7 +96,14 @@ func handleTask(task GetTaskReply, mapf func(string, string) []KeyValue,
 			file_list[i] = file
 		}
 
-		intermediate := mapf(task.MapTask.FileName, task.MapTask.Contents)
+		file, err := os.Open(task.MapTask.FileName)
+		if err != nil {
+			log.Fatalf("can't open %s", task.MapTask.FileName)
+		}
+		content, err := io.ReadAll(file)
+		content_str := string(content)
+
+		intermediate := mapf(task.MapTask.FileName, content_str)
 		sort.Sort(ByKey(intermediate))
 		i := 0
 		for i < len(intermediate) {

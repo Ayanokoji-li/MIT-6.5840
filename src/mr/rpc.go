@@ -75,7 +75,6 @@ type FinishTaskReply struct {
 
 type MapTask struct {
 	FileName string
-	Contents string
 	NReduce  int
 }
 
