@@ -43,7 +43,7 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	log.SetOutput(io.Discard)
+	// log.SetOutput(io.Discard)
 	workerID := initWorker()
 
 	for !CheckDone() {

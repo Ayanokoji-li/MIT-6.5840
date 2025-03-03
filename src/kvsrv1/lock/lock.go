@@ -2,7 +2,6 @@ package lock
 
 import (
 	"log"
-	"time"
 
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -15,6 +14,7 @@ type Lock struct {
 	// MakeLock().
 	ck       kvtest.IKVClerk
 	lockName string
+	holdVal  string
 }
 
 const (
@@ -36,29 +36,31 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 	}
 
 	lk.lockName = l
+	lk.holdVal = HOLDED + kvtest.RandValue(8)
 	return lk
 }
 
 func (lk *Lock) Acquire() {
 	log.Printf("[lock]: try to acquire lock %s", lk.lockName)
 	success := false
+
 	for !success {
 		value, version, ok := lk.ck.Get(lk.lockName)
 
 		success = (ok == rpc.OK && value == IDEL)
 
-		if success {
-			ok = lk.ck.Put(lk.lockName, HOLDED, version)
-
-			success = ok == rpc.OK
-		} else {
-			log.Printf("[lock]: rpc get failed. status: %v, value: %s, version: %v", ok, value, version)
+		if !success {
+			continue
 		}
 
-		if !success {
-			// time.Sleep(time.Millisecond * time.Duration(5000))
+		ok = lk.ck.Put(lk.lockName, lk.holdVal, version)
 
-			log.Printf("[lock]: acquire lock %s failed, sleep", lk.lockName)
+		success = ok == rpc.OK
+
+		if !success && ok == rpc.ErrMaybe {
+			value, _, ok := lk.ck.Get(lk.lockName)
+
+			success = ok == rpc.OK && value == lk.holdVal
 		}
 	}
 
@@ -68,27 +70,24 @@ func (lk *Lock) Acquire() {
 func (lk *Lock) Release() {
 	// Your code here
 	log.Printf("[lock]: try to release lock %s", lk.lockName)
-
 	success := false
 	for !success {
 		value, version, ok := lk.ck.Get(lk.lockName)
 
-		success = (ok == rpc.OK && value == HOLDED)
-
-		if success {
-			ok = lk.ck.Put(lk.lockName, IDEL, version)
-
-			success = ok == rpc.OK
-
-			if !success {
-				log.Printf("[lock]: rpc put failed")
-			}
-		}
+		success = (ok == rpc.OK && value == lk.holdVal)
 
 		if !success {
-			time.Sleep(time.Millisecond * time.Duration(5000))
+			break
+		}
 
-			log.Printf("[lock]: release lock %s failed, sleep", lk.lockName)
+		ok = lk.ck.Put(lk.lockName, IDEL, version)
+
+		success = ok == rpc.OK
+
+		if !success && ok == rpc.ErrMaybe {
+			_, cur_version, ok := lk.ck.Get(lk.lockName)
+
+			success = ok == rpc.OK && cur_version > version
 		}
 	}
 

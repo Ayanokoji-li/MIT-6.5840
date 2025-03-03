@@ -2,7 +2,6 @@ package mr
 
 import (
 	"container/list"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -235,7 +234,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c.server()
-	log.SetOutput(io.Discard)
+	// log.SetOutput(io.Discard)
 	log.Printf("Coordinator server starts")
 	return &c
 }
