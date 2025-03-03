@@ -2,10 +2,12 @@ package kvsrv
 
 import (
 	// "log"
+	"io"
+	"log"
 	"testing"
 
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
 
 type TestKV struct {
@@ -15,6 +17,7 @@ type TestKV struct {
 }
 
 func MakeTestKV(t *testing.T, reliable bool) *TestKV {
+	log.SetOutput(io.Discard)
 	cfg := tester.MakeConfig(t, 1, reliable, StartKVServer)
 	ts := &TestKV{
 		t:        t,
