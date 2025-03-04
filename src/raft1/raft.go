@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -26,9 +27,9 @@ import (
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
-	"6.5840/tester1"
+	"6.5840/logger"
+	tester "6.5840/tester1"
 )
-
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -51,6 +52,101 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type AppendEntriesArgs struct {
+	Term         int // leader’s term
+	LeaderID     int // leader's ID
+	PrevLogIndex int // index of log entry immediately preceding new ones
+	PrevLogTerm  int // term of prevLogIndex entry
+	LeaderCommit int // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // currentTerm, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	leader_term := args.Term
+	leader_id := args.LeaderID
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if leader_term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		logger.Log(logger.DAppend, "S%d <- S%d: Leader out of date", leader_id, rf.me)
+	} else {
+		rf.votedFor = leader_id
+		rf.reset_timer()
+		rf.currentTerm = leader_term
+		rf.state = FOLLOWER
+
+		reply.Term = leader_term
+		reply.Success = true
+		logger.Log(logger.DAppend, "S%d <- S%d: Update status successfully", leader_id, rf.me)
+	}
+}
+
+func (rf *Raft) sendAppend(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	logger.Log(logger.DAppend, "S%d -> S%d: Send append entries", rf.me, server)
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppends() {
+	connected_num := len(rf.peers) - 1
+	for server := range len(rf.peers) {
+		if server == rf.me {
+			continue
+		}
+
+		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
+		reply := AppendEntriesReply{}
+		resultCh := make(chan bool, 1)
+
+		go func() {
+			ok := rf.sendAppend(server, &args, &reply)
+			resultCh <- ok
+		}()
+
+		select {
+		case <-resultCh:
+			{
+				if !reply.Success {
+					if reply.Term > rf.currentTerm {
+						rf.mu.Lock()
+						rf.currentTerm = reply.Term
+						rf.state = FOLLOWER
+						rf.mu.Unlock()
+						logger.Log(logger.DFollower, "S%d: out-of-date, become follower", rf.me)
+					} else {
+						logger.Log(logger.DAppend, "S%d: Update S%d error", rf.me, server)
+					}
+				}
+			}
+		case <-time.After(time.Duration(5) * time.Millisecond):
+			{
+				connected_num -= 1
+				logger.Log(logger.DWarn, "S%d: Send append entries time-out", rf.me)
+			}
+		}
+
+	}
+	logger.Log(logger.DAppend, "S%d: Append entries send end", rf.me)
+
+	if connected_num == 0 {
+		logger.Log(logger.DWarn, "S%d: No connected server, become follower", rf.me)
+		rf.mu.Lock()
+		rf.state = FOLLOWER
+		rf.mu.Unlock()
+	}
+}
+
+const (
+	FOLLOWER  int = 0
+	CANDIDATE int = 1
+	LEADER    int = 2
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -63,16 +159,23 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state int
+	timer *time.Timer
+
+	currentTerm int // latest term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    int // candidateId that received vote in current term (or null if none)
+
+	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	return rf.currentTerm, rf.state == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -92,7 +195,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -114,7 +216,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -124,22 +225,60 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term        int // candidate’s term
+	CandidateID int // candidate requesting vote
+
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm  int // term of candidate’s last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	to_vote := args.CandidateID
+	require_term := args.Term
+	logger.Log(logger.DVote, "S%d <- S%d: Got vote request", to_vote, rf.me)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if require_term > rf.currentTerm {
+		rf.currentTerm = require_term
+		rf.state = FOLLOWER
+		rf.votedFor = to_vote
+		rf.reset_timer()
+
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, rf.me)
+	} else if rf.votedFor == -1 || rf.votedFor == to_vote {
+		rf.reset_timer()
+		rf.state = FOLLOWER
+
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, rf.me)
+	} else {
+		if require_term < rf.currentTerm {
+			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, out of date. cur term: %d, request term: %d", to_vote, rf.me, rf.currentTerm, require_term)
+		} else if rf.votedFor != to_vote {
+			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, have voted to S%d", to_vote, rf.me, rf.votedFor)
+		}
+
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -170,10 +309,66 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	logger.Log(logger.DVote, "S%d -> S%d: Request vote", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
+func (rf *Raft) tryLeader() {
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.state = CANDIDATE
+	rf.votedFor = rf.me
+	rf.mu.Unlock()
+	connected_num := len(rf.peers)
+	voteGranted_num := 1
+
+	for server := range len(rf.peers) {
+		if server == rf.me {
+			continue
+		}
+
+		args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
+		reply := RequestVoteReply{}
+		resultCh := make(chan bool, 1)
+		go func() {
+			ok := rf.sendRequestVote(server, &args, &reply)
+			resultCh <- ok
+		}()
+
+		select {
+		case <-resultCh:
+			{
+				if reply.VoteGranted {
+					voteGranted_num += 1
+				} else if reply.Term > rf.currentTerm {
+					rf.mu.Lock()
+					rf.currentTerm = reply.Term
+					rf.state = FOLLOWER
+					rf.mu.Unlock()
+					return
+				}
+
+			}
+		case <-time.After(time.Duration(5) * time.Millisecond):
+			{
+				logger.Log(logger.DWarn, "S%d: Request vote time-out", rf.me)
+				connected_num -= 1
+			}
+		}
+
+	}
+
+	logger.Log(logger.DVote, "S%d: Recv vote %d in %d", rf.me, voteGranted_num, connected_num)
+
+	if connected_num > 1 && voteGranted_num >= (connected_num+2)/2 && rf.state == CANDIDATE {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		rf.state = LEADER
+		logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
+	}
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -193,7 +388,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
 
 	return index, term, isLeader
 }
@@ -217,17 +411,44 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) reset_timer() {
+	ms := 50 + (rand.Int63() % 300)
+	logger.Log(logger.DTimer, "S%d: Timer reseted for %d ms", rf.me, ms)
+	rf.timer = time.NewTimer(time.Millisecond * time.Duration(ms))
+}
+
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		rf.mu.Lock()
+		select {
+		case <-rf.timer.C:
+			{
+				logger.Log(logger.DTimer, "S%d: Timer time-out", rf.me)
+				rf.mu.Unlock()
+				if rf.state != LEADER {
+					logger.Log(logger.DInfo, "S%d: haven't recived append entries, become candidator", rf.me)
+					rf.tryLeader()
+				}
 
+				if rf.state == LEADER {
+					logger.Log(logger.DLeader, "S%d: Start send append entries", rf.me)
+					rf.sendAppends()
+				}
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+				rf.mu.Lock()
+				rf.reset_timer()
+				rf.mu.Unlock()
+			}
+		default:
+			{
+				rf.mu.Unlock()
+				// logger.Log(logger.DTimer, "S%d: Sleep wait timer", rf.me)
+				// time.Sleep(time.Duration(50) * time.Millisecond)
+			}
+		}
 	}
 }
 
@@ -242,19 +463,21 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
+	rf := &Raft{timer: time.NewTimer(time.Duration(50+(rand.Int63()%300)) * time.Millisecond)}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.state = FOLLOWER
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }

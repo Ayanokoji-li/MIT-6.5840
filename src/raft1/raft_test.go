@@ -17,7 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"6.5840/tester1"
+	"6.5840/logger"
+	tester "6.5840/tester1"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -64,6 +65,7 @@ func TestReElection3A(t *testing.T) {
 
 	// if the leader disconnects, a new one should be elected.
 	ts.g.DisconnectAll(leader1)
+	logger.Log(logger.DDisconnect, "S%d: disconnected", leader1)
 	ts.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
@@ -106,6 +108,10 @@ func TestManyElections3A(t *testing.T) {
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
+		logger.Log(logger.DDisconnect, "S%d: disconnected", i1)
+		logger.Log(logger.DDisconnect, "S%d: disconnected", i2)
+		logger.Log(logger.DDisconnect, "S%d: disconnected", i3)
+
 		ts.g.DisconnectAll(i1)
 		ts.g.DisconnectAll(i2)
 		ts.g.DisconnectAll(i3)
