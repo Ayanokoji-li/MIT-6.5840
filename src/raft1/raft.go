@@ -97,17 +97,22 @@ func (rf *Raft) sendAppend(server int, args *AppendEntriesArgs, reply *AppendEnt
 }
 
 func (rf *Raft) sendAppends() {
+
+	rf.mu.Lock()
+	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
+	rf.mu.Unlock()
+
 	connected_num := len(rf.peers) - 1
 	for server := range len(rf.peers) {
 		if server == rf.me {
 			continue
 		}
 
-		if rf.state != LEADER {
+		_, is_leader := rf.GetState()
+		if !is_leader {
 			break
 		}
 
-		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
 		reply := AppendEntriesReply{}
 		resultCh := make(chan bool, 1)
 
@@ -120,15 +125,15 @@ func (rf *Raft) sendAppends() {
 		case <-resultCh:
 			{
 				if !reply.Success {
+					rf.mu.Lock()
 					if reply.Term > rf.currentTerm {
-						rf.mu.Lock()
+						logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", rf.me, rf.currentTerm, reply.Term)
 						rf.currentTerm = reply.Term
 						rf.state = FOLLOWER
-						rf.mu.Unlock()
-						logger.Log(logger.DFollower, "S%d: out-of-date, become follower", rf.me)
 					} else {
 						logger.Log(logger.DAppend, "S%d: Update S%d error", rf.me, server)
 					}
+					rf.mu.Unlock()
 				}
 			}
 		case <-time.After(TIMEOUT_LIMIT):
@@ -183,7 +188,16 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (3A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.state == LEADER
+}
+
+func (rf *Raft) GetDetailState() (int, int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.currentTerm, rf.state
 }
 
 // save Raft's persistent state to stable storage,
@@ -263,30 +277,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = require_term
 		rf.state = FOLLOWER
 		rf.votedFor = to_vote
+		reply.Term = rf.currentTerm
 		rf.reset_timer()
 		rf.mu.Unlock()
 
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, rf.me)
 	} else if rf.votedFor == -1 || rf.votedFor == to_vote {
 		rf.reset_timer()
 		rf.state = FOLLOWER
+		reply.Term = rf.currentTerm
 		rf.mu.Unlock()
 
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, rf.me)
 	} else {
-		rf.mu.Unlock()
+		reply.Term = rf.currentTerm
 
 		if require_term < rf.currentTerm {
 			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, out of date. cur term: %d, request term: %d", to_vote, rf.me, rf.currentTerm, require_term)
 		} else if rf.votedFor != to_vote {
 			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, have voted to S%d", to_vote, rf.me, rf.votedFor)
 		}
+		rf.mu.Unlock()
 
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
 }
@@ -324,11 +338,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) tryLeader() {
+func (rf *Raft) tryLeader() bool {
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.state = CANDIDATE
 	rf.votedFor = rf.me
+	args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
 	rf.mu.Unlock()
 	connected_num := len(rf.peers)
 	voteGranted_num := 1
@@ -338,12 +353,12 @@ func (rf *Raft) tryLeader() {
 			continue
 		}
 
-		if rf.state == FOLLOWER {
+		cur_term, cur_state := rf.GetDetailState()
+		if cur_state == FOLLOWER {
 			logger.Log(logger.DFollower, "S%d: Have been follower, stop requesting vote", rf.me, voteGranted_num, connected_num)
-			return
+			return false
 		}
 
-		args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
 		reply := RequestVoteReply{}
 		resultCh := make(chan bool, 1)
 		go func() {
@@ -356,12 +371,12 @@ func (rf *Raft) tryLeader() {
 			{
 				if reply.VoteGranted {
 					voteGranted_num += 1
-				} else if reply.Term > rf.currentTerm {
+				} else if reply.Term > cur_term {
 					rf.mu.Lock()
 					rf.currentTerm = reply.Term
 					rf.state = FOLLOWER
 					rf.mu.Unlock()
-					return
+					return false
 				}
 
 			}
@@ -382,7 +397,10 @@ func (rf *Raft) tryLeader() {
 
 		rf.state = LEADER
 		logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
+		return true
 	}
+
+	return false
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -444,14 +462,16 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.timer.C:
 			{
-				logger.Log(logger.DTimer, "S%d: Timer time-out", rf.me)
 				rf.mu.Unlock()
-				if rf.state != LEADER {
+				logger.Log(logger.DTimer, "S%d: Timer time-out", rf.me)
+
+				_, is_leader := rf.GetState()
+				if !is_leader {
 					logger.Log(logger.DInfo, "S%d: haven't recived append entries, become candidator", rf.me)
-					rf.tryLeader()
+					is_leader = rf.tryLeader()
 				}
 
-				if rf.state == LEADER {
+				if is_leader {
 					logger.Log(logger.DLeader, "S%d: Start send append entries", rf.me)
 					rf.sendAppends()
 				}
