@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"6.5840/labrpc"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -100,7 +100,7 @@ func (ts *Test) checkTerms() int {
 			if term == -1 {
 				term = xterm
 			} else if term != xterm {
-				ts.Fatalf("servers disagree on term")
+				ts.Fatalf("servers disagree on term: %d, xterm: %d", term, xterm)
 			}
 		}
 	}

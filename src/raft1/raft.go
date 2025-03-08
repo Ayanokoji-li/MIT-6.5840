@@ -65,6 +65,10 @@ type AppendEntriesReply struct {
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 }
 
+const (
+	TIMEOUT_LIMIT = time.Duration(5) * time.Millisecond
+)
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	leader_term := args.Term
 	leader_id := args.LeaderID
@@ -99,6 +103,10 @@ func (rf *Raft) sendAppends() {
 			continue
 		}
 
+		if rf.state != LEADER {
+			break
+		}
+
 		args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.me}
 		reply := AppendEntriesReply{}
 		resultCh := make(chan bool, 1)
@@ -123,7 +131,7 @@ func (rf *Raft) sendAppends() {
 					}
 				}
 			}
-		case <-time.After(time.Duration(5) * time.Millisecond):
+		case <-time.After(TIMEOUT_LIMIT):
 			{
 				connected_num -= 1
 				logger.Log(logger.DWarn, "S%d: Send append entries time-out", rf.me)
@@ -249,15 +257,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	to_vote := args.CandidateID
 	require_term := args.Term
-	logger.Log(logger.DVote, "S%d <- S%d: Got vote request", to_vote, rf.me)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if require_term > rf.currentTerm {
 		rf.currentTerm = require_term
 		rf.state = FOLLOWER
 		rf.votedFor = to_vote
 		rf.reset_timer()
+		rf.mu.Unlock()
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -265,11 +272,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if rf.votedFor == -1 || rf.votedFor == to_vote {
 		rf.reset_timer()
 		rf.state = FOLLOWER
+		rf.mu.Unlock()
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, rf.me)
 	} else {
+		rf.mu.Unlock()
+
 		if require_term < rf.currentTerm {
 			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, out of date. cur term: %d, request term: %d", to_vote, rf.me, rf.currentTerm, require_term)
 		} else if rf.votedFor != to_vote {
@@ -328,6 +338,11 @@ func (rf *Raft) tryLeader() {
 			continue
 		}
 
+		if rf.state == FOLLOWER {
+			logger.Log(logger.DFollower, "S%d: Have been follower, stop requesting vote", rf.me, voteGranted_num, connected_num)
+			return
+		}
+
 		args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me}
 		reply := RequestVoteReply{}
 		resultCh := make(chan bool, 1)
@@ -350,7 +365,7 @@ func (rf *Raft) tryLeader() {
 				}
 
 			}
-		case <-time.After(time.Duration(5) * time.Millisecond):
+		case <-time.After(TIMEOUT_LIMIT):
 			{
 				logger.Log(logger.DWarn, "S%d: Request vote time-out", rf.me)
 				connected_num -= 1
@@ -412,7 +427,10 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) reset_timer() {
-	ms := 50 + (rand.Int63() % 300)
+	var ms int64 = 75
+	if rf.state != LEADER {
+		ms += rand.Int63()%128 + 75
+	}
 	logger.Log(logger.DTimer, "S%d: Timer reseted for %d ms", rf.me, ms)
 	rf.timer = time.NewTimer(time.Millisecond * time.Duration(ms))
 }
@@ -445,8 +463,6 @@ func (rf *Raft) ticker() {
 		default:
 			{
 				rf.mu.Unlock()
-				// logger.Log(logger.DTimer, "S%d: Sleep wait timer", rf.me)
-				// time.Sleep(time.Duration(50) * time.Millisecond)
 			}
 		}
 	}
