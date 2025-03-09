@@ -72,6 +72,7 @@ func TestReElection3A(t *testing.T) {
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	ts.g.ConnectOne(leader1)
+	logger.Log(logger.DDisconnect, "S%d: connected", leader1)
 	leader2 := ts.checkOneLeader()
 
 	// if there's no quorum, no new leader should
@@ -121,8 +122,11 @@ func TestManyElections3A(t *testing.T) {
 		ts.checkOneLeader()
 
 		ts.g.ConnectOne(i1)
+		logger.Log(logger.DDisconnect, "S%d: connected", i1)
 		ts.g.ConnectOne(i2)
+		logger.Log(logger.DDisconnect, "S%d: connected", i2)
 		ts.g.ConnectOne(i3)
+		logger.Log(logger.DDisconnect, "S%d: connected", i3)
 	}
 	ts.checkOneLeader()
 }
