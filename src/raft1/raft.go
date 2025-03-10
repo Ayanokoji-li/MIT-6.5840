@@ -64,8 +64,8 @@ const (
 )
 
 type LogEntry struct {
-	command interface{}
-	term    int
+	Command interface{}
+	Term    int
 }
 
 // A Go object implementing a single Raft peer.
@@ -178,6 +178,12 @@ func rfGetVoteFor() RaftGetIntOption {
 func rfGetMe() RaftGetIntOption {
 	return func(rf *Raft) int {
 		return rf.me
+	}
+}
+
+func rfGetCommID() RaftGetIntOption {
+	return func(rf *Raft) int {
+		return rf.commitIndex
 	}
 }
 
@@ -351,53 +357,73 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) tryLeader() bool {
-
 	rf_metadata := rf.getInt(rfGetMe(), rfGetCurTerm())
 	me := rf_metadata[0]
 	cur_term := rf_metadata[1] + 1
 	args := RequestVoteArgs{Term: cur_term, CandidateID: me}
 
 	rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
-	connected_num := len(rf.peers)
+	connected_num := 1
 	voteGranted_num := 1
+	reply_chan := make(chan int, len(rf.peers))
 
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
 
-		cur_term, cur_state := rf.GetDetailState()
-		if cur_state == FOLLOWER {
-			logger.Log(logger.DFollower, "S%d: Have been follower, stop requesting vote", me, voteGranted_num, connected_num)
-			return false
-		}
-
-		reply := RequestVoteReply{}
-		resultCh := make(chan bool, 1)
-		go func() {
-			ok := rf.sendRequestVote(server, &args, &reply)
-			resultCh <- ok
-		}()
-
-		select {
-		case <-resultCh:
-			{
-				if reply.VoteGranted {
-					voteGranted_num += 1
-				} else if reply.Term > cur_term {
-					rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
-					return false
-				}
-
-			}
-		case <-time.After(TIMEOUT_LIMIT):
-			{
-				logger.Log(logger.DWarn, "S%d: Request vote time-out", rf.me)
-				connected_num -= 1
-			}
-		}
+		go rf.requestVoteFromPeer(server, args, reply_chan)
 	}
 
+	timer := time.NewTimer(TIMEOUT_LIMIT)
+	defer timer.Stop()
+
+	return rf.collectVotes(reply_chan, timer, connected_num, voteGranted_num, me)
+}
+
+func (rf *Raft) requestVoteFromPeer(server int, args RequestVoteArgs, reply_chan chan int) {
+	cur_term, cur_state := rf.GetDetailState()
+	if cur_state == FOLLOWER {
+		reply_chan <- -1
+		return
+	}
+
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(server, &args, &reply)
+	if ok {
+		if reply.VoteGranted {
+			reply_chan <- 1
+		} else if reply.Term > cur_term {
+			rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
+			reply_chan <- -1
+		} else {
+			reply_chan <- 0
+		}
+	}
+}
+
+func (rf *Raft) collectVotes(reply_chan chan int, timer *time.Timer, connected_num, voteGranted_num, me int) bool {
+	for {
+		select {
+		case reply := <-reply_chan:
+			if reply == -1 {
+				logger.Log(logger.DFollower, "S%d: Have been follower, stop requesting vote", me, voteGranted_num, connected_num)
+				return false
+			}
+			connected_num++
+			if reply == 1 {
+				voteGranted_num++
+			}
+			if connected_num == len(rf.peers) {
+				return rf.checkVotes(voteGranted_num, connected_num, me)
+			}
+		case <-timer.C:
+			return rf.checkVotes(voteGranted_num, connected_num, me)
+		}
+	}
+}
+
+func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
 	logger.Log(logger.DVote, "S%d: Recv vote %d in %d", me, voteGranted_num, connected_num)
 	_, cur_state := rf.GetDetailState()
 
@@ -415,6 +441,7 @@ type AppendEntriesArgs struct {
 	LeaderID     int // leader's ID
 	PrevLogIndex int // index of log entry immediately preceding new ones
 	PrevLogTerm  int // term of prevLogIndex entry
+	Entries      []LogEntry
 	LeaderCommit int // leader's commitIndex
 }
 
@@ -497,11 +524,6 @@ func (rf *Raft) sendAppends() {
 
 	}
 	logger.Log(logger.DAppend, "S%d: Append entries send end", me)
-
-	if connected_num == 0 {
-		logger.Log(logger.DWarn, "S%d: No connected server, become follower", me)
-		rf.update(rfUpdateState(FOLLOWER))
-	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -517,10 +539,16 @@ func (rf *Raft) sendAppends() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// index := -1
-	// term := -1
-	// isLeader := true
 
+	rf_metadata := rf.getInt(rfGetCommID(), rfGetCurTerm(), rfGetState())
+	index := rf_metadata[0] + 1
+	term := rf_metadata[1]
+	isLeader := rf_metadata[2] == LEADER
+	logger.Log(logger.DInfo, "S%d: get start call", rf.me)
+
+	if isLeader {
+		go rf.sendAppends()
+	}
 	// Your code here (3B).
 
 	return index, term, isLeader
