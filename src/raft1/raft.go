@@ -95,9 +95,9 @@ type Raft struct {
 }
 
 func (rf *Raft) reset_timer() {
-	var ms int64 = 50
+	var ms int64 = 75
 	if rf.state != LEADER {
-		ms += rand.Int63()%128 + 50
+		ms += rand.Int63()%128 + 75
 	}
 	logger.Log(logger.DTimer, "S%d: Timer reseted for %d ms", rf.me, ms)
 	rf.timer = time.NewTimer(time.Millisecond * time.Duration(ms))
@@ -323,33 +323,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	logger.Log(logger.DVote, "S%d -> S%d: Request vote", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -372,7 +345,7 @@ func (rf *Raft) tryLeader() bool {
 			continue
 		}
 
-		go rf.requestVoteFromPeer(server, args, reply_chan)
+		go rf.requestVoteFromPeer(server, args, reply_chan, cur_term)
 	}
 
 	timer := time.NewTimer(TIMEOUT_LIMIT)
@@ -381,13 +354,7 @@ func (rf *Raft) tryLeader() bool {
 	return rf.collectVotes(reply_chan, timer, connected_num, voteGranted_num, me)
 }
 
-func (rf *Raft) requestVoteFromPeer(server int, args RequestVoteArgs, reply_chan chan int) {
-	cur_term, cur_state := rf.GetDetailState()
-	if cur_state == FOLLOWER {
-		reply_chan <- -1
-		return
-	}
-
+func (rf *Raft) requestVoteFromPeer(server int, args RequestVoteArgs, reply_chan chan int, cur_term int) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, &args, &reply)
 	if ok {
@@ -477,53 +444,59 @@ func (rf *Raft) sendAppend(server int, args *AppendEntriesArgs, reply *AppendEnt
 	return ok
 }
 
-func (rf *Raft) sendAppends() {
+func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, me int, cur_term int, is_once bool) {
+
+	reply := AppendEntriesReply{}
+	reply_chan := make(chan bool, 1)
+	in_loop := true
+	for in_loop {
+		_, is_leader := rf.GetState()
+		if !is_leader {
+			logger.Log(logger.DAppend, "S%d: Not leader, stop Append to S%d", me, server)
+			return
+		}
+
+		go func() {
+			ok := rf.sendAppend(server, &args, &reply)
+			if ok {
+				if !reply.Success {
+					logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", me, cur_term, reply.Term)
+					rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
+				} else {
+					logger.Log(logger.DAppend, "S%d: Update S%d successfully", me, server)
+				}
+			}
+			reply_chan <- ok
+		}()
+
+		select {
+		case <-reply_chan:
+			{
+				in_loop = false
+			}
+		case <-time.After(TIMEOUT_LIMIT):
+			{
+				in_loop = !is_once
+				logger.Log(logger.DWarn, "S%d: Send append entries time-out", me)
+			}
+		}
+	}
+}
+
+func (rf *Raft) sendAppends(is_once bool) {
 
 	rf_metadata := rf.getInt(rfGetCurTerm(), rfGetMe())
 	cur_term := rf_metadata[0]
 	me := rf_metadata[1]
 	args := AppendEntriesArgs{Term: cur_term, LeaderID: me}
 
-	connected_num := len(rf.peers) - 1
 	for server := range rf.peers {
 		if server == me {
 			continue
 		}
 
-		_, is_leader := rf.GetState()
-		if !is_leader {
-			break
-		}
-
-		reply := AppendEntriesReply{}
-		resultCh := make(chan bool, 1)
-
-		go func() {
-			ok := rf.sendAppend(server, &args, &reply)
-			resultCh <- ok
-		}()
-
-		select {
-		case <-resultCh:
-			{
-				if !reply.Success {
-					if reply.Term > cur_term {
-						logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", me, cur_term, reply.Term)
-						rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
-					} else {
-						logger.Log(logger.DAppend, "S%d: Update S%d error", me, server)
-					}
-				}
-			}
-		case <-time.After(TIMEOUT_LIMIT):
-			{
-				connected_num -= 1
-				logger.Log(logger.DWarn, "S%d: Send append entries time-out", me)
-			}
-		}
-
+		go rf.sendAppendToPeer(server, args, me, cur_term, is_once)
 	}
-	logger.Log(logger.DAppend, "S%d: Append entries send end", me)
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -541,17 +514,17 @@ func (rf *Raft) sendAppends() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf_metadata := rf.getInt(rfGetCommID(), rfGetCurTerm(), rfGetState())
-	index := rf_metadata[0] + 1
+	commID := rf_metadata[0] + 1
 	term := rf_metadata[1]
 	isLeader := rf_metadata[2] == LEADER
 	logger.Log(logger.DInfo, "S%d: get start call", rf.me)
 
 	if isLeader {
-		go rf.sendAppends()
+		go rf.sendAppends(false)
 	}
 	// Your code here (3B).
 
-	return index, term, isLeader
+	return commID, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -590,7 +563,7 @@ func (rf *Raft) ticker() {
 
 			if is_leader {
 				logger.Log(logger.DLeader, "S%d: Start send append entries", me)
-				rf.sendAppends()
+				rf.sendAppends(true)
 			}
 
 			rf.update(rfUpdateTimer())
@@ -620,6 +593,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.commitIndex = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
