@@ -55,6 +55,7 @@ type ApplyMsg struct {
 const (
 	TIMEOUT_LIMIT = time.Duration(5) * time.Millisecond
 	TICKER_INTER  = time.Duration(10) * time.Millisecond
+	RETYR_WAIT    = time.Duration(50) * time.Millisecond
 )
 
 const (
@@ -91,7 +92,7 @@ type Raft struct {
 	lastApplied int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	nextIndex   []int //for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex  []int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-
+	apply_chan  chan ApplyMsg
 }
 
 func (rf *Raft) reset_timer() {
@@ -105,6 +106,7 @@ func (rf *Raft) reset_timer() {
 
 type RaftUpdateOption func(*Raft)
 type RaftGetIntOption func(*Raft) int
+type RaftGetArrOption func(*Raft) []int
 
 func (rf *Raft) update(options ...RaftUpdateOption) {
 	rf.mu.Lock()
@@ -127,6 +129,25 @@ func (rf *Raft) getInt(options ...RaftGetIntOption) []int {
 	return ret
 }
 
+func (rf *Raft) getArr(options ...RaftGetArrOption) [][]int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	var ret [][]int
+	for _, option := range options {
+		ret = append(ret, option(rf))
+	}
+
+	return ret
+}
+
+func (rf *Raft) getLog() []LogEntry {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.log
+}
+
 func rfUpdateState(state int) RaftUpdateOption {
 	return func(rf *Raft) {
 		rf.state = state
@@ -145,15 +166,53 @@ func rfUpdateCurTerm(term int) RaftUpdateOption {
 	}
 }
 
-func rfUpdateAddCurTerm(adder int) RaftUpdateOption {
-	return func(rf *Raft) {
-		rf.currentTerm += adder
-	}
-}
-
 func rfUpdateVotedFor(voted int) RaftUpdateOption {
 	return func(rf *Raft) {
 		rf.votedFor = voted
+	}
+}
+
+func rfUpdateAllNextID() RaftUpdateOption {
+	return func(rf *Raft) {
+		for index := range rf.nextIndex {
+			rf.nextIndex[index] = len(rf.log)
+		}
+	}
+}
+
+func rfUpdateNextID(server int, nextID int) RaftUpdateOption {
+	return func(rf *Raft) {
+		rf.nextIndex[server] = nextID
+	}
+}
+
+func rfUpdateOneLog(log LogEntry) RaftUpdateOption {
+	return func(rf *Raft) {
+		logger.Log(logger.DLog, "S%d: update log %+v", rf.me, log)
+		rf.log = append(rf.log, log)
+	}
+}
+
+func rfUpdateMulLog(logs []LogEntry) RaftUpdateOption {
+	return func(rf *Raft) {
+		logger.Log(logger.DLog, "S%d: update log %+v", rf.me, logs)
+		rf.log = append(rf.log, logs...)
+	}
+}
+
+func rfUpdataCommID(commID int) RaftUpdateOption {
+	return func(rf *Raft) {
+		if commID > rf.commitIndex {
+			logger.Log(logger.DCommit, "S%d: update commitID %d", rf.me, commID)
+			rf.commitIndex = commID
+			for i := rf.lastApplied + 1; i <= commID; i++ {
+				apply_msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
+
+				rf.apply_chan <- apply_msg
+				logger.Log(logger.DCommit, "S%d: apply msg %v", rf.me, apply_msg)
+			}
+			rf.lastApplied = commID
+		}
 	}
 }
 
@@ -184,6 +243,24 @@ func rfGetMe() RaftGetIntOption {
 func rfGetCommID() RaftGetIntOption {
 	return func(rf *Raft) int {
 		return rf.commitIndex
+	}
+}
+
+func rfGetLastApplied() RaftGetIntOption {
+	return func(rf *Raft) int {
+		return rf.lastApplied
+	}
+}
+
+func rfGetLogLen() RaftGetIntOption {
+	return func(rf *Raft) int {
+		return len(rf.log)
+	}
+}
+
+func rfGetNextID() RaftGetArrOption {
+	return func(rf *Raft) []int {
+		return rf.nextIndex
 	}
 }
 
@@ -390,13 +467,17 @@ func (rf *Raft) collectVotes(reply_chan chan int, timer *time.Timer, connected_n
 	}
 }
 
+func (rf *Raft) becomeLeader() {
+	rf.update(rfUpdateState(LEADER), rfUpdateAllNextID())
+	logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
+}
+
 func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
 	logger.Log(logger.DVote, "S%d: Recv vote %d in %d", me, voteGranted_num, connected_num)
 	_, cur_state := rf.GetDetailState()
 
 	if connected_num > 1 && voteGranted_num >= (connected_num+2)/2 && cur_state == CANDIDATE {
-		rf.update(rfUpdateState(LEADER))
-		logger.Log(logger.DLeader, "S%d: Become leader", me)
+		rf.becomeLeader()
 		return true
 	}
 
@@ -420,6 +501,8 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	leader_term := args.Term
 	leader_id := args.LeaderID
+	logs := args.Entries
+	commID := args.LeaderCommit
 
 	rf_metadata := rf.getInt(rfGetCurTerm(), rfGetMe())
 	cur_term := rf_metadata[0]
@@ -430,7 +513,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		logger.Log(logger.DAppend, "S%d <- S%d: Leader out of date", leader_id, me)
 	} else {
-		rf.update(rfUpdateVotedFor(leader_id), rfUpdateTimer(), rfUpdateCurTerm(leader_term), rfUpdateState(FOLLOWER))
+		rf.update(rfUpdateVotedFor(leader_id), rfUpdateTimer(), rfUpdateCurTerm(leader_term), rfUpdateState(FOLLOWER), rfUpdateMulLog(logs), rfUpdataCommID(commID))
 
 		reply.Term = leader_term
 		reply.Success = true
@@ -444,10 +527,18 @@ func (rf *Raft) sendAppend(server int, args *AppendEntriesArgs, reply *AppendEnt
 	return ok
 }
 
-func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, me int, cur_term int, is_once bool) {
-
+func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, nextID int, log []LogEntry, reply_chan chan bool, me int, cur_term int, is_once bool) {
+	if len(log) > nextID {
+		args.Entries = log[nextID:]
+		args.PrevLogIndex = nextID - 1
+		if args.PrevLogIndex >= 0 {
+			args.PrevLogTerm = log[args.PrevLogIndex].Term
+		} else {
+			args.PrevLogTerm = 0
+		}
+	}
 	reply := AppendEntriesReply{}
-	reply_chan := make(chan bool, 1)
+	state_chan := make(chan bool, 1)
 	in_loop := true
 	for in_loop {
 		_, is_leader := rf.GetState()
@@ -459,25 +550,30 @@ func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, me int, cur
 		go func() {
 			ok := rf.sendAppend(server, &args, &reply)
 			if ok {
+				state_chan <- reply.Success
 				if !reply.Success {
 					logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", me, cur_term, reply.Term)
 					rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
 				} else {
+					rf.update(rfUpdateNextID(server, len(log)))
 					logger.Log(logger.DAppend, "S%d: Update S%d successfully", me, server)
 				}
+			} else {
+				state_chan <- false
 			}
-			reply_chan <- ok
 		}()
 
 		select {
-		case <-reply_chan:
+		case to_reply := <-state_chan:
 			{
 				in_loop = false
+				reply_chan <- to_reply
 			}
 		case <-time.After(TIMEOUT_LIMIT):
 			{
 				in_loop = !is_once
-				logger.Log(logger.DWarn, "S%d: Send append entries time-out", me)
+				logger.Log(logger.DWarn, "S%d: Send append entries time-out, wait", me)
+				time.Sleep(RETYR_WAIT)
 			}
 		}
 	}
@@ -485,18 +581,50 @@ func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, me int, cur
 
 func (rf *Raft) sendAppends(is_once bool) {
 
-	rf_metadata := rf.getInt(rfGetCurTerm(), rfGetMe())
-	cur_term := rf_metadata[0]
-	me := rf_metadata[1]
-	args := AppendEntriesArgs{Term: cur_term, LeaderID: me}
+	rf_int_metadata := rf.getInt(rfGetCurTerm(), rfGetMe(), rfGetCommID())
+	rf_arr_metadata := rf.getArr(rfGetNextID())
+	log := rf.getLog()
+	cur_term := rf_int_metadata[0]
+	me := rf_int_metadata[1]
+	commID := rf_int_metadata[2]
+	nextIDs := rf_arr_metadata[0]
+	args := AppendEntriesArgs{Term: cur_term, LeaderID: me, Entries: []LogEntry{}, LeaderCommit: commID}
+	reply_chan := make(chan bool, len(rf.peers))
 
 	for server := range rf.peers {
 		if server == me {
 			continue
 		}
-
-		go rf.sendAppendToPeer(server, args, me, cur_term, is_once)
+		go rf.sendAppendToPeer(server, args, nextIDs[server], log, reply_chan, me, cur_term, is_once)
 	}
+	if len(log) > commID+1 {
+
+		go rf.appendCollector(reply_chan, log)
+	}
+}
+
+func (rf *Raft) appendCollector(reply_chan chan bool, logs []LogEntry) {
+	reply_num := 0
+	for reply := range reply_chan {
+		_, is_leader := rf.GetState()
+		if !is_leader {
+			return
+		}
+
+		if reply {
+			reply_num += 1
+			logger.Log(logger.DAppend, "S%d: Append success, reply num %d", rf.me, reply_num)
+			if reply_num >= len(rf.peers)/2 {
+				rf.commitLog(logs)
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) commitLog(logs []LogEntry) {
+	rf.update(rfUpdataCommID(len(logs) - 1))
+	logger.Log(logger.DCommit, "S%d: log has replicated more than half, commit log %v", rf.me, logs[len(logs)-1])
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -513,18 +641,19 @@ func (rf *Raft) sendAppends(is_once bool) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
-	rf_metadata := rf.getInt(rfGetCommID(), rfGetCurTerm(), rfGetState())
-	commID := rf_metadata[0] + 1
-	term := rf_metadata[1]
+	rf_metadata := rf.getInt(rfGetLogLen(), rfGetCurTerm(), rfGetState())
+	commID := rf_metadata[0]
+	cur_term := rf_metadata[1]
 	isLeader := rf_metadata[2] == LEADER
-	logger.Log(logger.DInfo, "S%d: get start call", rf.me)
 
 	if isLeader {
+		logger.Log(logger.DServe, "S%d: get start service call", rf.me)
+		rf.update(rfUpdateOneLog(LogEntry{Command: command, Term: cur_term}))
 		go rf.sendAppends(false)
 	}
-	// Your code here (3B).
 
-	return commID, term, isLeader
+	logger.Log(logger.DServe, "S%d: return args: %d, %d, %t", rf.me, commID, cur_term, isLeader)
+	return commID + 1, cur_term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -584,16 +713,24 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{timer: time.NewTimer(time.Duration(50+(rand.Int63()%300)) * time.Millisecond)}
+	rf := &Raft{timer: time.NewTimer(time.Duration(rand.Int63()%25) * time.Millisecond)}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.apply_chan = applyCh
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.state = FOLLOWER
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = -1
+	rf.lastApplied = -1
+
+	rf.log = []LogEntry{}
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 0
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

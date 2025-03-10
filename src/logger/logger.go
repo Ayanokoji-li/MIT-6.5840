@@ -45,6 +45,7 @@ const (
 	DVote       logTopic = "VOTE"
 	DWarn       logTopic = "WARN"
 	DDisconnect logTopic = "DCON"
+	DServe      logTopic = "SERV"
 )
 
 var logStart time.Time
