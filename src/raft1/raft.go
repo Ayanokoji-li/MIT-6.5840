@@ -94,6 +94,8 @@ type Raft struct {
 	matchIndex   []int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 	apply_chan   chan ApplyMsg
 	apply_signal chan bool
+
+	start_mu sync.Mutex
 }
 
 func (rf *Raft) reset_timer() {
@@ -204,17 +206,9 @@ func rfUpdateMulLog(logs []LogEntry, prev_index int) RaftUpdateOption {
 
 func rfUpdataCommID(commID int) RaftUpdateOption {
 	return func(rf *Raft) {
-		if commID > rf.commitIndex || rf.lastApplied != rf.commitIndex {
-			rf.commitIndex = commID
-			i := rf.lastApplied + 1
-
-			if i <= commID && i < len(rf.log) {
-				apply_msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
-
-				logger.Log(logger.DCommit, "S%d: to apply msg %v", rf.me, apply_msg)
-				rf.apply_chan <- apply_msg
-			}
-			rf.lastApplied = i
+		if commID > rf.commitIndex {
+			rf.commitIndex = min(commID, len(rf.log))
+			rf.apply_signal <- true
 			logger.Log(logger.DCommit, "S%d: update commitID %d, last apply %d", rf.me, commID, rf.lastApplied)
 		}
 	}
@@ -385,23 +379,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	to_vote := args.CandidateID
 	require_term := args.Term
-	last_commID := args.LastLogIndex
+	last_logID := args.LastLogIndex
 	last_term := args.LastLogTerm
 
 	logs := rf.getLog()
-	rf_metadata := rf.getInt(rfGetCurTerm(), rfGetMe(), rfGetVoteFor(), rfGetCommID())
+	rf_metadata := rf.getInt(rfGetCurTerm(), rfGetMe(), rfGetVoteFor())
 	cur_term := rf_metadata[0]
 	me := rf_metadata[1]
 	vote_for := rf_metadata[2]
-	me_commID := rf_metadata[3]
+	me_last_logID := len(logs) - 1
 
-	me_last_term := -1
-	if me_commID != -1 {
-		me_last_term = logs[me_commID].Term
+	me_last_term := 0
+	if me_last_logID != -1 {
+		me_last_term = logs[me_last_logID].Term
 	}
 
 	reply.Term = cur_term
-	if last_term >= me_last_term && last_commID >= me_commID {
+	if last_term >= me_last_term && last_logID >= me_last_logID {
 		if require_term > cur_term {
 			rf.update(rfUpdateCurTerm(require_term), rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateTimer())
 
@@ -425,7 +419,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}
 	} else {
-		logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, last term: %d : %d last log comm: %d : %d", to_vote, me, last_term, me_last_term, last_commID, me_commID)
+		logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, last term: %d : %d last log comm: %d : %d", to_vote, me, last_term, me_last_term, last_logID, me_last_logID)
 	}
 }
 
@@ -437,21 +431,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) tryLeader() bool {
 	logs := rf.getLog()
-	rf_metadata := rf.getInt(rfGetMe(), rfGetCurTerm(), rfGetState(), rfGetCommID())
+	rf_metadata := rf.getInt(rfGetMe(), rfGetCurTerm(), rfGetState())
 	me := rf_metadata[0]
 	cur_term := rf_metadata[1]
 	state := rf_metadata[2]
-	commID := rf_metadata[3]
 	if state == FOLLOWER {
 		cur_term += 1
 	}
-	var last_term int
-	if commID == -1 {
-		last_term = 0
-	} else {
-		last_term = logs[commID].Term
+	last_term := 0
+	last_logID := len(logs) - 1
+	if last_logID >= 0 {
+		last_term = logs[last_logID].Term
 	}
-	args := RequestVoteArgs{Term: cur_term, CandidateID: me, LastLogIndex: commID, LastLogTerm: last_term}
+	args := RequestVoteArgs{Term: cur_term, CandidateID: me, LastLogIndex: last_logID, LastLogTerm: last_term}
 
 	rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
 	connected_num := 1
@@ -704,7 +696,8 @@ func (rf *Raft) commitLog(logs []LogEntry) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-
+	rf.start_mu.Lock()
+	defer rf.start_mu.Unlock()
 	rf_metadata := rf.getInt(rfGetLogLen(), rfGetCurTerm(), rfGetState())
 	commID := rf_metadata[0]
 	cur_term := rf_metadata[1]
@@ -714,8 +707,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		logger.Log(logger.DServe, "S%d: get start service call", rf.me)
 		rf.update(rfUpdateOneLog(LogEntry{Command: command, Term: cur_term}))
 		go rf.sendAppends(false)
+		logger.Log(logger.DInfo, "S%d: cmd %v start return commID %d term %d is leader %v", rf.me, command, commID+1, cur_term, isLeader)
 	}
-
 	return commID + 1, cur_term, isLeader
 }
 
@@ -788,7 +781,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.commitIndex = -1
 	rf.lastApplied = -1
-	rf.apply_signal = make(chan bool, 10)
+	rf.apply_signal = make(chan bool, 100)
 
 	rf.log = []LogEntry{}
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -812,9 +805,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 			i := last_apply + 1
 			for ; i <= commID && i < len(logs); i++ {
-				apply_msg := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i + 1}
 
+				apply_msg := ApplyMsg{CommandValid: true, Command: logs[i].Command, CommandIndex: i + 1}
 				logger.Log(logger.DCommit, "S%d: to apply msg %v", me, apply_msg)
+
 				rf.apply_chan <- apply_msg
 			}
 
