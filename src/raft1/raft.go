@@ -204,8 +204,16 @@ func rfUpdateMulLog(logs []LogEntry, prev_index int) RaftUpdateOption {
 	}
 }
 
+func rfUpdateRMLog() RaftUpdateOption {
+	return func(rf *Raft) {
+		rf.log = rf.log[:rf.commitIndex+1]
+	}
+}
+
 func rfUpdataCommID(commID int) RaftUpdateOption {
 	return func(rf *Raft) {
+		logger.Log(logger.DCommit, "S%d: cur commID %d", rf.me, rf.commitIndex)
+
 		if commID > rf.commitIndex {
 			rf.commitIndex = min(commID, len(rf.log))
 			rf.apply_signal <- true
@@ -220,11 +228,17 @@ func rfUpdateLastApplied(last_applied int) RaftUpdateOption {
 	}
 }
 
-func rfUpdateMatchID() RaftUpdateOption {
+func rfUpdateAllMatchID() RaftUpdateOption {
 	return func(rf *Raft) {
 		for i := range rf.matchIndex {
 			rf.matchIndex[i] = -1
 		}
+	}
+}
+
+func rfUpdateMatchID(server int, matchID int) RaftUpdateOption {
+	return func(rf *Raft) {
+		rf.matchIndex[server] = matchID
 	}
 }
 
@@ -395,9 +409,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = cur_term
-	if last_term >= me_last_term && last_logID >= me_last_logID {
+	if last_term > me_last_term || (last_term == me_last_term && last_logID >= me_last_logID) {
 		if require_term > cur_term {
-			rf.update(rfUpdateCurTerm(require_term), rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateTimer())
+			rf.update(rfUpdateCurTerm(require_term), rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateRMLog(), rfUpdateTimer())
 
 			reply.VoteGranted = true
 
@@ -501,7 +515,7 @@ func (rf *Raft) collectVotes(reply_chan chan int, timer *time.Timer, connected_n
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.update(rfUpdateState(LEADER), rfUpdateAllNextID(), rfUpdateMatchID())
+	rf.update(rfUpdateState(LEADER), rfUpdateAllNextID(), rfUpdateAllMatchID())
 	logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
 }
 
@@ -514,6 +528,7 @@ func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
 		return true
 	}
 
+	rf.update(rfUpdateTimer(), rfUpdateVotedFor(-1))
 	return false
 }
 
@@ -606,7 +621,7 @@ func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, nextID int,
 				if !reply.Success {
 					if reply.Term > cur_term {
 						logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", me, cur_term, reply.Term)
-						rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
+						rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER), rfUpdateRMLog())
 					} else {
 						rf.update(rfUpdateNextID(server, nextID-1))
 						logger.Log(logger.DAppend, "S%d: fail to update S%d, try resend from %d", me, server, nextID-1)
@@ -785,8 +800,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.log = []LogEntry{}
 	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = 0
+		rf.matchIndex[i] = 0
 	}
 
 	// initialize from state persisted before a crash
