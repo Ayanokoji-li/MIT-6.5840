@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 
 	"math/rand"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,6 +87,7 @@ type Raft struct {
 
 	currentTerm int // latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor    int // candidateId that received vote in current term (or null if none)
+	voteChan    chan bool
 
 	log          []LogEntry
 	commitIndex  int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -437,86 +439,112 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVoteWithTimer(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	logger.Log(logger.DVote, "S%d -> S%d: Request vote", rf.me, server)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+
+	res_chan := make(chan bool, 1)
+	go func() {
+		ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+		res_chan <- ok
+	}()
+
+	timer := time.NewTimer(TIMEOUT_LIMIT)
+
+	select {
+	case ok := <-res_chan:
+		{
+			return ok
+		}
+	case <-timer.C:
+		{
+			logger.Log(logger.DVote, "S%d -> S%d: Request time out", rf.me, server)
+			return false
+		}
+	}
 }
 
-func (rf *Raft) tryLeader() bool {
-	logs := rf.getLog()
-	rf_metadata := rf.getInt(rfGetMe(), rfGetCurTerm(), rfGetState())
-	me := rf_metadata[0]
-	cur_term := rf_metadata[1]
-	state := rf_metadata[2]
-	if state == FOLLOWER {
-		cur_term += 1
-	}
-	last_term := 0
-	last_logID := len(logs) - 1
-	if last_logID >= 0 {
-		last_term = logs[last_logID].Term
-	}
-	args := RequestVoteArgs{Term: cur_term, CandidateID: me, LastLogIndex: last_logID, LastLogTerm: last_term}
+func (rf *Raft) setupVoteRoutines() {
+	ctrl_chan := make(chan bool)
+	reply_chan := make(chan bool, len(rf.peers))
+	modify_chan := make(chan bool, 1)
+	chanUpdate_mu := sync.Mutex{}
+	me := rf.me
+	args := RequestVoteArgs{CandidateID: me}
 
-	rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
-	connected_num := 1
-	voteGranted_num := 1
-	reply_chan := make(chan int, len(rf.peers))
-
-	for server := range rf.peers {
-		if server == rf.me {
+	for i := range rf.peers {
+		if i == rf.me {
 			continue
 		}
 
-		go rf.requestVoteFromPeer(server, args, reply_chan, cur_term)
+		peerID := i
+		go func() {
+			chanUpdate_mu.Lock()
+			for {
+				chanUpdate_mu.Unlock()
+				<-ctrl_chan
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVoteWithTimer(peerID, &args, &reply)
+				if ok {
+					if reply.VoteGranted {
+						reply_chan <- true
+					} else {
+						reply_chan <- false
+						able_modify := <-modify_chan
+						if reply.Term > args.Term && able_modify {
+							rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
+						}
+					}
+				} else {
+					reply_chan <- false
+				}
+
+				chanUpdate_mu.Lock()
+			}
+		}()
 	}
 
-	timer := time.NewTimer(TIMEOUT_LIMIT)
-	defer timer.Stop()
+	go func() {
+		for <-rf.voteChan {
+			rf_metadata := rf.getInt(rfGetCurTerm(), rfGetState())
+			logs := rf.getLog()
+			cur_term := rf_metadata[0]
+			state := rf_metadata[1]
+			if state == FOLLOWER {
+				cur_term += 1
+			}
+			last_term := 0
+			last_logID := len(logs) - 1
+			if last_logID >= 0 {
+				last_term = logs[last_logID].Term
+			}
+			rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
 
-	return rf.collectVotes(reply_chan, timer, connected_num, voteGranted_num, me)
-}
+			chanUpdate_mu.Lock()
+			args.Term = cur_term
+			args.LastLogIndex = last_logID
+			args.LastLogTerm = last_term
 
-func (rf *Raft) requestVoteFromPeer(server int, args RequestVoteArgs, reply_chan chan int, cur_term int) {
-	reply := RequestVoteReply{}
-	ok := rf.sendRequestVote(server, &args, &reply)
-	if ok {
-		if reply.VoteGranted {
-			reply_chan <- 1
-		} else if reply.Term > cur_term {
-			rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
-			reply_chan <- -1
-		} else {
-			reply_chan <- 0
+			modify_chan = make(chan bool, 1)
+			modify_chan <- true
+			close(ctrl_chan)
+
+			connected_num := 1
+			voteGranted_num := 1
+			for connected_num < len(rf.peers) {
+				reply := <-reply_chan
+				connected_num += 1
+				if reply {
+					voteGranted_num += 1
+				}
+			}
+			rf.voteChan <- rf.checkVotes(voteGranted_num, connected_num, me)
+
+			close(modify_chan)
+			ctrl_chan = make(chan bool)
+
+			chanUpdate_mu.Unlock()
 		}
-	}
-}
-
-func (rf *Raft) collectVotes(reply_chan chan int, timer *time.Timer, connected_num, voteGranted_num, me int) bool {
-	for {
-		select {
-		case reply := <-reply_chan:
-			if reply == -1 {
-				logger.Log(logger.DFollower, "S%d: Have been follower, stop requesting vote", me, voteGranted_num, connected_num)
-				return false
-			}
-			connected_num++
-			if reply == 1 {
-				voteGranted_num++
-			}
-			if connected_num == len(rf.peers) {
-				return rf.checkVotes(voteGranted_num, connected_num, me)
-			}
-		case <-timer.C:
-			return rf.checkVotes(voteGranted_num, connected_num, me)
-		}
-	}
-}
-
-func (rf *Raft) becomeLeader() {
-	rf.update(rfUpdateState(LEADER), rfUpdateAllNextID(), rfUpdateAllMatchID())
-	logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
+	}()
 }
 
 func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
@@ -524,7 +552,9 @@ func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
 	_, cur_state := rf.GetDetailState()
 
 	if connected_num > 1 && voteGranted_num >= (connected_num+2)/2 && cur_state == CANDIDATE {
-		rf.becomeLeader()
+		rf.update(rfUpdateState(LEADER), rfUpdateAllNextID(), rfUpdateAllMatchID())
+		logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
+
 		return true
 	}
 
@@ -758,7 +788,8 @@ func (rf *Raft) ticker() {
 			_, is_leader := rf.GetState()
 			if !is_leader {
 				logger.Log(logger.DInfo, "S%d: haven't recived append entries, become candidator", me)
-				is_leader = rf.tryLeader()
+				rf.voteChan <- true
+				is_leader = <-rf.voteChan
 			}
 
 			if is_leader {
@@ -797,6 +828,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.apply_signal = make(chan bool, 100)
+	rf.voteChan = make(chan bool, 1)
 
 	rf.log = []LogEntry{}
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -810,6 +842,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	rf.setupVoteRoutines()
 	go rf.ticker()
 
 	go func() {
