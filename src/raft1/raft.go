@@ -54,9 +54,9 @@ type ApplyMsg struct {
 }
 
 const (
-	TIMEOUT_LIMIT = time.Duration(5) * time.Millisecond
-	TICKER_INTER  = time.Duration(10) * time.Millisecond
-	RETYR_WAIT    = time.Duration(90) * time.Millisecond
+	TIMEOUT_LIMIT = time.Duration(3) * time.Millisecond
+	TICKER_INTER  = time.Duration(1) * time.Millisecond
+	MAX_LOG_LEN   = 30
 )
 
 const (
@@ -90,6 +90,7 @@ type Raft struct {
 	voteChan    chan bool
 
 	log          []LogEntry
+	appendChan   chan bool
 	commitIndex  int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	lastApplied  int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
 	nextIndex    []int //for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
@@ -101,9 +102,9 @@ type Raft struct {
 }
 
 func (rf *Raft) reset_timer() {
-	var ms int64 = 75
+	var ms int64 = 50
 	if rf.state != LEADER {
-		ms += rand.Int63()%128 + 75
+		ms += rand.Int63()%128 + 60
 	}
 	logger.Log(logger.DTimer, "S%d: Timer reseted for %d ms", rf.me, ms)
 	rf.timer = time.NewTimer(time.Millisecond * time.Duration(ms))
@@ -196,6 +197,7 @@ func rfUpdateOneLog(log LogEntry) RaftUpdateOption {
 	return func(rf *Raft) {
 		logger.Log(logger.DLog, "S%d: update log %+v", rf.me, log)
 		rf.log = append(rf.log, log)
+		rf.matchIndex[rf.me] = len(rf.log)
 	}
 }
 
@@ -206,34 +208,37 @@ func rfUpdateMulLog(logs []LogEntry, prev_index int) RaftUpdateOption {
 	}
 }
 
-func rfUpdateRMLog() RaftUpdateOption {
-	return func(rf *Raft) {
-		rf.log = rf.log[:rf.commitIndex+1]
-	}
-}
-
 func rfUpdataCommID(commID int) RaftUpdateOption {
 	return func(rf *Raft) {
-		logger.Log(logger.DCommit, "S%d: cur commID %d", rf.me, rf.commitIndex)
-
-		if commID > rf.commitIndex {
-			rf.commitIndex = min(commID, len(rf.log))
-			rf.apply_signal <- true
-			logger.Log(logger.DCommit, "S%d: update commitID %d, last apply %d", rf.me, commID, rf.lastApplied)
+		if commID < rf.commitIndex {
+			return
 		}
-	}
-}
+		rf.commitIndex = min(commID, len(rf.log)-1)
+		logger.Log(logger.DCommit, "S%d: update cur commID %d", rf.me, rf.commitIndex)
 
-func rfUpdateLastApplied(last_applied int) RaftUpdateOption {
-	return func(rf *Raft) {
-		rf.lastApplied = last_applied
+		if rf.commitIndex != rf.lastApplied && rf.commitIndex >= 0 {
+			last_applied := rf.lastApplied
+			rf.lastApplied = rf.commitIndex
+			commID := rf.commitIndex
+			log := rf.log
+			go func() {
+				i := last_applied + 1
+				for ; i <= commID; i++ {
+					rf.apply_chan <- ApplyMsg{CommandValid: true, Command: log[i].Command, CommandIndex: i + 1}
+				}
+				logger.Log(logger.DCommit, "S%d: commit to id %d", rf.me, rf.lastApplied)
+			}()
+		}
 	}
 }
 
 func rfUpdateAllMatchID() RaftUpdateOption {
 	return func(rf *Raft) {
 		for i := range rf.matchIndex {
-			rf.matchIndex[i] = -1
+			rf.matchIndex[i] = -2
+			if i == rf.me {
+				rf.matchIndex[i] = len(rf.log)
+			}
 		}
 	}
 }
@@ -241,6 +246,34 @@ func rfUpdateAllMatchID() RaftUpdateOption {
 func rfUpdateMatchID(server int, matchID int) RaftUpdateOption {
 	return func(rf *Raft) {
 		rf.matchIndex[server] = matchID
+	}
+}
+
+func rfUpdateCheckMatch() RaftUpdateOption {
+	return func(rf *Raft) {
+		new_commID := rf.commitIndex
+		for {
+			replic_num := 0
+			for i, matchID := range rf.matchIndex {
+				logger.Log(logger.DCommit, "S%d: S%d's match is %d, cur commid %d", rf.me, i, matchID, rf.commitIndex)
+
+				if matchID > new_commID {
+					replic_num += 1
+				}
+			}
+			logger.Log(logger.DCommit, "S%d: majority with %d", rf.me, replic_num)
+			if replic_num >= (len(rf.peers)+1)/2 {
+				new_commID = new_commID + 1
+				logger.Log(logger.DCommit, "S%d: majority with %d, update commID %d", rf.me, replic_num, new_commID)
+				if new_commID == len(rf.log)-1 {
+					break
+				}
+			} else {
+				logger.Log(logger.DCommit, "S%d: stop match check", rf.me)
+				break
+			}
+		}
+		rfUpdataCommID(new_commID)(rf)
 	}
 }
 
@@ -274,12 +307,6 @@ func rfGetCommID() RaftGetIntOption {
 	}
 }
 
-func rfGetLastApplied() RaftGetIntOption {
-	return func(rf *Raft) int {
-		return rf.lastApplied
-	}
-}
-
 func rfGetLogLen() RaftGetIntOption {
 	return func(rf *Raft) int {
 		return len(rf.log)
@@ -289,6 +316,12 @@ func rfGetLogLen() RaftGetIntOption {
 func rfGetNextID() RaftGetArrOption {
 	return func(rf *Raft) []int {
 		return rf.nextIndex
+	}
+}
+
+func rfGetMatchID() RaftGetArrOption {
+	return func(rf *Raft) []int {
+		return rf.matchIndex
 	}
 }
 
@@ -413,7 +446,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = cur_term
 	if last_term > me_last_term || (last_term == me_last_term && last_logID >= me_last_logID) {
 		if require_term > cur_term {
-			rf.update(rfUpdateCurTerm(require_term), rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateRMLog(), rfUpdateTimer())
+			rf.update(rfUpdateCurTerm(require_term), rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateTimer())
 
 			reply.VoteGranted = true
 
@@ -464,44 +497,10 @@ func (rf *Raft) sendRequestVoteWithTimer(server int, args *RequestVoteArgs, repl
 }
 
 func (rf *Raft) setupVoteRoutines() {
-	ctrl_chan := make(chan bool)
+	rf.voteChan = make(chan bool, 1)
 	reply_chan := make(chan bool, len(rf.peers))
-	modify_chan := make(chan bool, 1)
-	chanUpdate_mu := sync.Mutex{}
 	me := rf.me
 	args := RequestVoteArgs{CandidateID: me}
-
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		peerID := i
-		go func() {
-			chanUpdate_mu.Lock()
-			for {
-				chanUpdate_mu.Unlock()
-				<-ctrl_chan
-				reply := RequestVoteReply{}
-				ok := rf.sendRequestVoteWithTimer(peerID, &args, &reply)
-				if ok {
-					if reply.VoteGranted {
-						reply_chan <- true
-					} else {
-						reply_chan <- false
-						able_modify := <-modify_chan
-						if reply.Term > args.Term && able_modify {
-							rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER))
-						}
-					}
-				} else {
-					reply_chan <- false
-				}
-
-				chanUpdate_mu.Lock()
-			}
-		}()
-	}
 
 	go func() {
 		for <-rf.voteChan {
@@ -519,14 +518,29 @@ func (rf *Raft) setupVoteRoutines() {
 			}
 			rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
 
-			chanUpdate_mu.Lock()
 			args.Term = cur_term
 			args.LastLogIndex = last_logID
 			args.LastLogTerm = last_term
 
-			modify_chan = make(chan bool, 1)
-			modify_chan <- true
-			close(ctrl_chan)
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+
+				peerID := i
+				go func() {
+					reply := RequestVoteReply{}
+					ok := rf.sendRequestVoteWithTimer(peerID, &args, &reply)
+					if ok {
+						reply_chan <- reply.VoteGranted
+						if !reply.VoteGranted && reply.Term > cur_term {
+							rf.update(rfUpdateState(FOLLOWER), rfUpdateCurTerm(reply.Term))
+						}
+					} else {
+						reply_chan <- false
+					}
+				}()
+			}
 
 			connected_num := 1
 			voteGranted_num := 1
@@ -538,11 +552,6 @@ func (rf *Raft) setupVoteRoutines() {
 				}
 			}
 			rf.voteChan <- rf.checkVotes(voteGranted_num, connected_num, me)
-
-			close(modify_chan)
-			ctrl_chan = make(chan bool)
-
-			chanUpdate_mu.Unlock()
 		}
 	}()
 }
@@ -606,6 +615,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			if prevLogTerm != me_logs[prevLogIndex].Term {
 				logger.Log(logger.DAppend, "S%d <- S%d: Fail, wrong prev log term", leader_id, me)
+				return
 			}
 		}
 
@@ -616,116 +626,116 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) sendAppend(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	logger.Log(logger.DAppend, "S%d -> S%d: log len: %d, prev id: %d, prev term: %d", rf.me, server, len(args.Entries), args.PrevLogIndex, args.PrevLogTerm)
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
+func (rf *Raft) sendAppendWithTimer(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	logger.Log(logger.DAppend, "S%d -> S%d: args %+v", rf.me, server, args)
 
-func (rf *Raft) sendAppendToPeer(server int, args AppendEntriesArgs, nextID int, log []LogEntry, reply_chan chan bool, me int, cur_term int, is_once bool) {
-	// nextID = max(nextID, 0)
-	args.PrevLogIndex = nextID - 1
-	if args.PrevLogIndex >= 0 {
-		args.PrevLogTerm = log[args.PrevLogIndex].Term
-	} else {
-		args.PrevLogTerm = 0
-	}
+	res_chan := make(chan bool, 1)
+	go func() {
+		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		res_chan <- ok
+	}()
 
-	if len(log) > nextID {
-		args.Entries = log[nextID:]
-	}
-	state_chan := make(chan bool, 1)
-	in_loop := true
-	for in_loop {
-		_, is_leader := rf.GetState()
-		if !is_leader {
-			logger.Log(logger.DAppend, "S%d: Not leader, stop Append to S%d", me, server)
-			return
+	timer := time.NewTimer(TIMEOUT_LIMIT)
+
+	select {
+	case ok := <-res_chan:
+		{
+			return ok
 		}
 
-		go func() {
-			reply := AppendEntriesReply{}
-			ok := rf.sendAppend(server, &args, &reply)
-			if ok {
-				state_chan <- reply.Success
-				if !reply.Success {
-					if reply.Term > cur_term {
-						logger.Log(logger.DFollower, "S%d: out-of-date, become follower. Self: %d, reply: %d", me, cur_term, reply.Term)
-						rf.update(rfUpdateCurTerm(reply.Term), rfUpdateState(FOLLOWER), rfUpdateRMLog())
-					} else {
-						rf.update(rfUpdateNextID(server, nextID-1))
-						logger.Log(logger.DAppend, "S%d: fail to update S%d, try resend from %d", me, server, nextID-1)
-					}
-				} else {
-					rf.update(rfUpdateNextID(server, len(log)))
-					logger.Log(logger.DAppend, "S%d: Update S%d next id: %d", me, server, len(log))
+	case <-timer.C:
+		{
+			logger.Log(logger.DAppend, "S%d -> S%d: Append time out", rf.me, server)
+			return false
+		}
+	}
+
+}
+
+func (rf *Raft) setupAppendRoutine() {
+	rf.appendChan = make(chan bool)
+	reply_chan := make(chan bool, len(rf.peers)-1)
+	me := rf.me
+
+	go func() {
+		for <-rf.appendChan {
+			logs := rf.getLog()
+			rf_int_metadata := rf.getInt(rfGetCurTerm(), rfGetCommID())
+			cur_term := rf_int_metadata[0]
+			commID := rf_int_metadata[1]
+			rf_arr_metadata := rf.getArr(rfGetNextID(), rfGetMatchID())
+			nextIDs := rf_arr_metadata[0]
+			matchIDs := rf_arr_metadata[1]
+			logger.Log(logger.DAppend, "S%d: match id %v", me, matchIDs)
+
+			for i := range rf.peers {
+				if i == me {
+					continue
 				}
-			} else {
-				state_chan <- false
+
+				peerID := i
+				go func() {
+
+					lastID := nextIDs[peerID] - 1
+					last_term := 0
+					if lastID >= 0 {
+						last_term = logs[lastID].Term
+					}
+
+					args := AppendEntriesArgs{
+						LeaderID:     me,
+						LeaderCommit: commID,
+						Term:         cur_term,
+						PrevLogIndex: lastID,
+						PrevLogTerm:  last_term,
+					}
+					if matchIDs[peerID] > -2 {
+						args.LeaderCommit = commID
+						if len(logs) > nextIDs[peerID] {
+							args.Entries = logs[nextIDs[peerID]:]
+
+							if len(args.Entries) > MAX_LOG_LEN {
+								args.Entries = args.Entries[:MAX_LOG_LEN]
+							}
+
+							logger.Log(logger.DAppend, "S%d: send to S%d from id %d", me, peerID, nextIDs[peerID])
+						}
+					} else {
+						args.LeaderCommit = -1
+					}
+					reply := AppendEntriesReply{}
+
+					ok := rf.sendAppendWithTimer(peerID, &args, &reply)
+					if ok {
+						if reply.Success {
+							if matchIDs[peerID] <= -2 {
+								rf.update(rfUpdateMatchID(peerID, lastID))
+								logger.Log(logger.DAppend, "S%d: match S%d", me, peerID)
+							} else {
+								rf.update(rfUpdateMatchID(peerID, nextIDs[peerID]+len(args.Entries)-1), rfUpdateNextID(peerID, nextIDs[peerID]+len(args.Entries)))
+								logger.Log(logger.DAppend, "S%d: update S%d next id to %d", me, peerID, nextIDs[peerID]+len(args.Entries))
+							}
+						} else if reply.Term <= cur_term {
+							rf.update(rfUpdateNextID(peerID, lastID))
+							logger.Log(logger.DAppend, "S%d: fail to update S%d, set next id %d", me, peerID, lastID)
+						} else {
+							rf.update(rfUpdateState(FOLLOWER), rfUpdateCurTerm(reply.Term))
+						}
+						reply_chan <- reply.Success
+					} else {
+						reply_chan <- false
+					}
+				}()
 			}
-		}()
 
-		select {
-		case to_reply := <-state_chan:
-			{
-				in_loop = !to_reply
-				reply_chan <- to_reply
+			for range len(rf.peers) - 1 {
+				<-reply_chan
 			}
-		case <-time.After(TIMEOUT_LIMIT):
-			{
-				in_loop = !is_once
-				logger.Log(logger.DWarn, "S%d: Send append entries time-out, wait", me)
-				time.Sleep(RETYR_WAIT)
-			}
+
+			rf.update(rfUpdateCheckMatch())
+			// rf.appendChan <- true
 		}
-	}
-}
-
-func (rf *Raft) sendAppends(is_once bool) {
-
-	rf_int_metadata := rf.getInt(rfGetCurTerm(), rfGetMe(), rfGetCommID())
-	rf_arr_metadata := rf.getArr(rfGetNextID())
-	log := rf.getLog()
-	cur_term := rf_int_metadata[0]
-	me := rf_int_metadata[1]
-	commID := rf_int_metadata[2]
-	nextIDs := rf_arr_metadata[0]
-	args := AppendEntriesArgs{Term: cur_term, LeaderID: me, Entries: []LogEntry{}, LeaderCommit: commID}
-	reply_chan := make(chan bool, len(rf.peers))
-
-	for server := range rf.peers {
-		if server == me {
-			continue
-		}
-		go rf.sendAppendToPeer(server, args, nextIDs[server], log, reply_chan, me, cur_term, is_once)
-	}
-	if len(log) > commID+1 {
-
-		go rf.appendCollector(reply_chan, log)
-	}
-}
-
-func (rf *Raft) appendCollector(reply_chan chan bool, logs []LogEntry) {
-	reply_num := 0
-	for reply := range reply_chan {
-		_, is_leader := rf.GetState()
-		if !is_leader {
-			return
-		}
-
-		if reply {
-			reply_num += 1
-			if reply_num >= len(rf.peers)/2 {
-				rf.commitLog(logs)
-				return
-			}
-		}
-	}
-}
-
-func (rf *Raft) commitLog(logs []LogEntry) {
-	rf.update(rfUpdataCommID(len(logs) - 1))
-	logger.Log(logger.DCommit, "S%d: log has replicated more than half, commit log %v", rf.me, logs[len(logs)-1])
+	}()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -751,8 +761,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		logger.Log(logger.DServe, "S%d: get start service call", rf.me)
 		rf.update(rfUpdateOneLog(LogEntry{Command: command, Term: cur_term}))
-		go rf.sendAppends(false)
-		logger.Log(logger.DInfo, "S%d: cmd %v start return commID %d term %d is leader %v", rf.me, command, commID+1, cur_term, isLeader)
 	}
 	return commID + 1, cur_term, isLeader
 }
@@ -794,7 +802,9 @@ func (rf *Raft) ticker() {
 
 			if is_leader {
 				logger.Log(logger.DLeader, "S%d: Start send append entries", me)
-				rf.sendAppends(true)
+				// rf.sendAppends(true)
+				rf.appendChan <- true
+				// <-rf.appendChan
 			}
 
 			rf.update(rfUpdateTimer())
@@ -828,7 +838,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.apply_signal = make(chan bool, 100)
-	rf.voteChan = make(chan bool, 1)
 
 	rf.log = []LogEntry{}
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -843,28 +852,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	rf.setupVoteRoutines()
+	rf.setupAppendRoutine()
 	go rf.ticker()
-
-	go func() {
-		me := rf.me
-		for range rf.apply_signal {
-			rf_metadata := rf.getInt(rfGetCommID(), rfGetLastApplied())
-			commID := rf_metadata[0]
-			last_apply := rf_metadata[1]
-			logs := rf.getLog()
-
-			i := last_apply + 1
-			for ; i <= commID && i < len(logs); i++ {
-
-				apply_msg := ApplyMsg{CommandValid: true, Command: logs[i].Command, CommandIndex: i + 1}
-				logger.Log(logger.DCommit, "S%d: to apply msg %v", me, apply_msg)
-
-				rf.apply_chan <- apply_msg
-			}
-
-			rf.update(rfUpdateLastApplied(i - 1))
-		}
-	}()
 
 	return rf
 }
