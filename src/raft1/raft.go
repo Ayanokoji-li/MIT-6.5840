@@ -22,6 +22,7 @@ import (
 
 	"bytes"
 	"math/rand"
+	"sort"
 
 	"sync"
 	"sync/atomic"
@@ -56,10 +57,10 @@ type ApplyMsg struct {
 }
 
 const (
-	LEADER_RESET_TIME        = 40
-	FOLLOWER_RESET_BASE_TIEM = 60
-	TIMEOUT_LIMIT            = time.Duration(15) * time.Millisecond
-	TICKER_INTER             = time.Duration(5) * time.Millisecond
+	LEADER_RESET_TIME        = 60
+	FOLLOWER_RESET_BASE_TIME = 80
+	TIMEOUT_LIMIT            = time.Duration(40) * time.Millisecond
+	TICKER_INTER             = time.Duration(10) * time.Millisecond
 	MAX_LOG_LEN              = 30
 )
 
@@ -91,15 +92,16 @@ type Raft struct {
 
 	CurrentTerm int // latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor    int // candidateId that received vote in current term (or null if none)
-	voteChan    chan bool
+	voteSignal  chan bool
 
-	Log         []LogEntry
-	appendChan  chan bool
-	CommitIndex int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
-	LastApplied int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-	nextIndex   []int //for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-	matchIndex  []int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-	apply_chan  chan ApplyMsg
+	Log          []LogEntry
+	appendSignal chan bool
+	CommitIndex  int   // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	LastApplied  int   // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+	nextIndex    []int //for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex   []int //for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+	applyChan    chan ApplyMsg
+	commitChan   chan ApplyMsg
 
 	start_mu sync.Mutex
 }
@@ -107,7 +109,7 @@ type Raft struct {
 func (rf *Raft) reset_timer() {
 	var ms int64 = LEADER_RESET_TIME
 	if rf.State != LEADER {
-		ms = rand.Int63()%128 + FOLLOWER_RESET_BASE_TIEM
+		ms = rand.Int63()%300 + FOLLOWER_RESET_BASE_TIME
 	}
 	logger.Log(logger.DTimer, "S%d: Timer reseted for %d ms", rf.me, ms)
 	rf.timer = time.NewTimer(time.Millisecond * time.Duration(ms))
@@ -153,13 +155,17 @@ func (rf *Raft) getArr(options ...RaftGetArrOption) [][]int {
 func (rf *Raft) getLog() []LogEntry {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	return rf.Log
+	ret := make([]LogEntry, len(rf.Log))
+	copy(ret, rf.Log)
+	return ret
+	// return rf.Log
 }
 
-func rfUpdateState(state int) RaftUpdateOption {
+func rfUpdateState(state int, cur_term int) RaftUpdateOption {
 	return func(rf *Raft) {
-		rf.State = state
+		if cur_term >= rf.CurrentTerm {
+			rf.State = state
+		}
 	}
 }
 
@@ -171,14 +177,18 @@ func rfUpdateTimer() RaftUpdateOption {
 
 func rfUpdateCurTerm(term int) RaftUpdateOption {
 	return func(rf *Raft) {
-		logger.Log(logger.DInfo, "S%d: update term from %d to %d", rf.me, rf.CurrentTerm, term)
-		rf.CurrentTerm = max(rf.CurrentTerm, term)
+		if term > rf.CurrentTerm {
+			logger.Log(logger.DInfo, "S%d: update term from %d to %d", rf.me, rf.CurrentTerm, term)
+			rf.CurrentTerm = max(rf.CurrentTerm, term)
+			rf.persist()
+		}
 	}
 }
 
 func rfUpdateVotedFor(voted int) RaftUpdateOption {
 	return func(rf *Raft) {
 		rf.votedFor = voted
+		rf.persist()
 	}
 }
 
@@ -208,15 +218,26 @@ func rfUpdateOneLog(log LogEntry) RaftUpdateOption {
 		rf.Log = append(rf.Log, log)
 		rf.matchIndex[rf.me] = len(rf.Log)
 		logger.Log(logger.DLog, "S%d: update log %+v total log len %d", rf.me, log, len(rf.Log))
-		// rf.persist()
+		rf.persist()
 	}
 }
 
 func rfUpdateMulLog(logs []LogEntry, prev_index int) RaftUpdateOption {
 	return func(rf *Raft) {
-		rf.Log = append(rf.Log[:prev_index+1], logs...)
-		logger.Log(logger.DLog, "S%d: append log %+v from index %d, log len %d", rf.me, logs, prev_index, len(rf.Log))
-		// rf.persist()
+		log_index := 0
+		if len(logs) > 0 {
+			for prev_index > 0 {
+				if prev_index < len(rf.Log) && log_index < len(logs) && rf.Log[prev_index].Term == logs[log_index].Term && rf.Log[prev_index].Command == logs[log_index].Command {
+					prev_index += 1
+					log_index += 1
+				} else {
+					break
+				}
+			}
+			rf.Log = append(rf.Log[:prev_index+1], logs[log_index:]...)
+			logger.Log(logger.DLog, "S%d: append log %+v from index %d, log len %d", rf.me, logs, prev_index, len(rf.Log))
+			rf.persist()
+		}
 	}
 }
 
@@ -292,13 +313,17 @@ func rfGetLastApplied() RaftGetIntOption {
 
 func rfGetNextID() RaftGetArrOption {
 	return func(rf *Raft) []int {
-		return rf.nextIndex
+		ret := make([]int, len(rf.peers))
+		copy(ret, rf.nextIndex)
+		return ret
 	}
 }
 
 func rfGetMatchID() RaftGetArrOption {
 	return func(rf *Raft) []int {
-		return rf.matchIndex
+		ret := make([]int, len(rf.peers))
+		copy(ret, rf.matchIndex)
+		return ret
 	}
 }
 
@@ -336,45 +361,50 @@ func (rf *Raft) is_timeout() bool {
 
 func (rf *Raft) commitCheck(commID int, last_applied int, log []LogEntry) {
 	go func() {
-		if commID != last_applied && commID >= 0 {
+		if commID != last_applied && commID >= 0 && !rf.killed() {
 			last_applied += 1
-			for ; last_applied <= commID; last_applied++ {
+			for ; last_applied <= commID && !rf.killed(); last_applied++ {
 				logger.Log(logger.DCommit, "S%d: commit %d log %v", rf.me, last_applied, log[last_applied])
-				rf.apply_chan <- ApplyMsg{CommandValid: true, Command: log[last_applied].Command, CommandIndex: last_applied + 1}
+				rf.commitChan <- ApplyMsg{CommandValid: true, Command: log[last_applied].Command, CommandIndex: last_applied + 1}
 			}
-			rf.update(rfUpdateLastApplied(last_applied - 1))
-			rf.persist()
+			if !rf.killed() {
+				rf.update(rfUpdateLastApplied(last_applied - 1))
+			}
 		}
 	}()
 }
 
 func (rf *Raft) matchCheck(commID int, matchIndex []int, curTerm int, log []LogEntry) {
+	logger.Log(logger.DCommit, "S%d: match check %v", rf.me, matchIndex)
+	to_check := make([]int, len(matchIndex))
+	copy(to_check, matchIndex)
+	sort.Slice(to_check, func(i, j int) bool {
+		return to_check[i] > to_check[j]
+	})
+	new_commID := max(commID, to_check[len(to_check)/2])
+	if new_commID >= 0 && new_commID > commID && log[new_commID].Term == curTerm && !rf.killed() {
+		rfUpdataCommID(new_commID)(rf)
+	}
+}
+
+func (rf *Raft) setupCommitRoutine() {
 	go func() {
-		new_commID := commID
-		for {
-			replic_num := 0
-			for i, matchID := range matchIndex {
-				logger.Log(logger.DCommit, "S%d: S%d's match is %d, cur commid %d", rf.me, i, matchID, commID)
+		last_applied := 0
+		commit_map := make(map[int]ApplyMsg)
+		for !rf.killed() {
+			to_commit := <-rf.commitChan
+			commit_map[to_commit.CommandIndex] = to_commit
 
-				if matchID > new_commID {
-					replic_num += 1
-				}
-			}
-			if replic_num >= (len(rf.peers)+1)/2 {
-				new_commID = new_commID + 1
-				logger.Log(logger.DCommit, "S%d: majority with %d servers, update commID %d", rf.me, replic_num, new_commID)
-				if new_commID == len(log)-1 {
+			for {
+				to_apply, exist := commit_map[last_applied+1]
+				if !exist {
 					break
+				} else {
+					rf.applyChan <- to_apply
+					last_applied += 1
 				}
-			} else {
-				logger.Log(logger.DCommit, "S%d: stop match check", rf.me)
-				break
 			}
 		}
-		if new_commID >= 0 && log[new_commID].Term == curTerm {
-			rfUpdataCommID(new_commID)(rf)
-		}
-
 	}()
 }
 
@@ -390,16 +420,10 @@ func (rf *Raft) persist() {
 	// Example:
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	logger.Log(logger.DPersist, "S%d: persist log with log len %d, commID %d, term %d, state %+v", rf.me, len(rf.Log), rf.CommitIndex, rf.CurrentTerm, rf.State)
-	e.Encode(rf.State)
-	e.Encode(rf.CommitIndex)
+	logger.Log(logger.DPersist, "S%d: persist log with log len %d, term %d, vote for %d", rf.me, len(rf.Log), rf.CurrentTerm, rf.votedFor)
+	e.Encode(rf.votedFor)
 	e.Encode(rf.CurrentTerm)
-	if rf.CommitIndex < 0 {
-		e.Encode(rf.Log)
-	} else {
-		e.Encode(rf.Log[:rf.CommitIndex+1])
-	}
-	// e.Encode(rf.Log)
+	e.Encode(rf.Log)
 
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
@@ -415,22 +439,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var State int
-	var CommitIndex int
+	var VotedFor int
 	var CurrentTerm int
 	var Log []LogEntry
-	if d.Decode(&State) != nil || d.Decode(&CommitIndex) != nil || d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil {
+	if d.Decode(&VotedFor) != nil || d.Decode(&CurrentTerm) != nil || d.Decode(&Log) != nil {
 		logger.Log(logger.DPersist, "S%d: error persist before", rf.me)
 	} else {
-		rf.State = State
-		rf.CommitIndex = CommitIndex
+		rf.votedFor = VotedFor
 		rf.CurrentTerm = CurrentTerm
 		rf.Log = Log
-
-		if rf.State == LEADER {
-			// rf.update(rfUpdateAllNextID(), rfUpdateAllMatchID())
-			rf.becomeLeader()
-		}
 
 		logger.Log(logger.DPersist, "S%d: recovered term %d, commID %d, log %v, state %v", rf.me, rf.CurrentTerm, rf.CommitIndex, rf.Log, rf.State)
 	}
@@ -486,31 +503,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = cur_term
-	if last_term > me_last_term || (last_term == me_last_term && last_logID >= me_last_logID) {
-		if require_term > cur_term {
-			rf.update(rfUpdateState(FOLLOWER), rfUpdateVotedFor(to_vote), rfUpdateTimer())
 
-			reply.VoteGranted = true
-
-			logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, me)
-		} else if vote_for == -1 || vote_for == to_vote {
-			rf.update(rfUpdateState(FOLLOWER), rfUpdateTimer())
-
-			reply.VoteGranted = true
-
-			logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, me)
-		} else {
-
-			if require_term < cur_term {
-				logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, out of date. cur term: %d, request term: %d", to_vote, me, cur_term, require_term)
-			} else if vote_for != to_vote {
-				logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, have voted to S%d", to_vote, me, vote_for)
-			}
-
-			reply.VoteGranted = false
-		}
+	if require_term < cur_term {
+		reply.VoteGranted = false
+		reply.Term = cur_term
+		logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, out of date. cur term: %d, request term: %d", to_vote, me, cur_term, require_term)
 	} else {
-		logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, last term: %d : %d last log comm: %d : %d", to_vote, me, last_term, me_last_term, last_logID, me_last_logID)
+		rf.update(rfUpdateCurTerm(require_term))
+		reply.Term = require_term
+		if require_term > cur_term || (vote_for == -1 || vote_for == to_vote) {
+			if last_term > me_last_term || (last_term == me_last_term && last_logID >= me_last_logID) {
+				reply.VoteGranted = true
+				logger.Log(logger.DVote, "S%d <- S%d: Got vote", to_vote, me)
+				rf.update(rfUpdateState(FOLLOWER, require_term), rfUpdateVotedFor((to_vote)), rfUpdateTimer())
+			} else {
+				reply.VoteGranted = false
+				logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, last term: %d : %d last log comm: %d : %d", to_vote, me, last_term, me_last_term, last_logID, me_last_logID)
+			}
+		} else {
+			reply.VoteGranted = false
+			logger.Log(logger.DInfo, "S%d </ S%d: Don't vote, have voted to S%d", to_vote, me, vote_for)
+		}
 	}
 }
 
@@ -539,13 +552,13 @@ func (rf *Raft) sendRequestVoteWithTimer(server int, args *RequestVoteArgs, repl
 }
 
 func (rf *Raft) setupVoteRoutines() {
-	rf.voteChan = make(chan bool, 1)
+	rf.voteSignal = make(chan bool, 1)
 	reply_chan := make(chan bool, len(rf.peers))
 	me := rf.me
 	args := RequestVoteArgs{CandidateID: me}
 
 	go func() {
-		for <-rf.voteChan {
+		for <-rf.voteSignal && !rf.killed() {
 			rf_metadata := rf.getInt(rfGetCurTerm(), rfGetState())
 			logs := rf.getLog()
 			cur_term := rf_metadata[0] + 1
@@ -554,7 +567,7 @@ func (rf *Raft) setupVoteRoutines() {
 			if last_logID >= 0 {
 				last_term = logs[last_logID].Term
 			}
-			rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE), rfUpdateVotedFor(me))
+			rf.update(rfUpdateCurTerm(cur_term), rfUpdateState(CANDIDATE, cur_term), rfUpdateVotedFor(me))
 
 			args.Term = cur_term
 			args.LastLogIndex = last_logID
@@ -570,10 +583,11 @@ func (rf *Raft) setupVoteRoutines() {
 					reply := RequestVoteReply{}
 					ok := rf.sendRequestVoteWithTimer(peerID, &args, &reply)
 					if ok {
-						reply_chan <- reply.VoteGranted
+						logger.Log(logger.DVote, "S%d: recv vote reply %v, cur term %d", me, reply, cur_term)
 						if !reply.VoteGranted && reply.Term > cur_term {
-							rf.update(rfUpdateState(FOLLOWER), rfUpdateCurTerm(reply.Term))
+							rf.update(rfUpdateState(FOLLOWER, reply.Term), rfUpdateCurTerm(reply.Term))
 						}
+						reply_chan <- reply.VoteGranted
 					} else {
 						reply_chan <- false
 					}
@@ -589,27 +603,24 @@ func (rf *Raft) setupVoteRoutines() {
 					voteGranted_num += 1
 				}
 			}
-			rf.voteChan <- rf.checkVotes(voteGranted_num, connected_num, me)
+			rf.voteSignal <- rf.checkVotes(voteGranted_num, connected_num, me, cur_term)
 		}
 	}()
 }
 
-func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int) bool {
+func (rf *Raft) checkVotes(voteGranted_num, connected_num, me int, cur_term int) bool {
 	logger.Log(logger.DVote, "S%d: Recv vote %d in %d", me, voteGranted_num, connected_num)
 	_, cur_state := rf.GetDetailState()
 
 	if connected_num > 1 && voteGranted_num >= (connected_num+2)/2 && cur_state == CANDIDATE {
-		rf.becomeLeader()
+		rf.update(rfUpdateState(LEADER, cur_term), rfUpdateAllNextID(), rfUpdateAllMatchID())
+		logger.Log(logger.DLeader, "S%d: Become leader term %d, logs %v", rf.me, rf.CurrentTerm, rf.Log)
+
 		return true
 	}
 
-	rf.update(rfUpdateTimer(), rfUpdateVotedFor(-1))
+	rf.update(rfUpdateTimer())
 	return false
-}
-
-func (rf *Raft) becomeLeader() {
-	rf.update(rfUpdateState(LEADER), rfUpdateAllNextID(), rfUpdateAllMatchID())
-	logger.Log(logger.DLeader, "S%d: Become leader", rf.me)
 }
 
 type AppendEntriesArgs struct {
@@ -622,8 +633,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // currentTerm, for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	Term          int  // currentTerm, for leader to update itself
+	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -638,24 +651,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	cur_term := rf_metadata[0]
 	me := rf_metadata[1]
 	me_logs := rf.getLog()
-	logger.Log(logger.DAppend, "S%d: get vote request, cur logs %v", me, me_logs)
+	logger.Log(logger.DAppend, "S%d: get append request, cur logs %v", me, me_logs)
 
 	if leader_term < cur_term {
 		reply.Term = cur_term
 		reply.Success = false
 		logger.Log(logger.DAppend, "S%d <- S%d: Leader out of date", leader_id, me)
 	} else {
-		rf.update(rfUpdateVotedFor(leader_id), rfUpdateTimer(), rfUpdateCurTerm(leader_term), rfUpdateState(FOLLOWER))
+		rf.update(rfUpdateVotedFor(leader_id), rfUpdateTimer(), rfUpdateState(FOLLOWER, leader_term), rfUpdateCurTerm(leader_term))
 
 		reply.Term = leader_term
 		if prevLogIndex != -1 {
 			reply.Success = false
 			if prevLogIndex >= len(me_logs) {
+				reply.ConflictIndex = len(me_logs) - 1
+
 				logger.Log(logger.DAppend, "S%d <- S%d: Fail, lack prev logs", leader_id, me)
 				return
 			}
 
 			if prevLogTerm != me_logs[prevLogIndex].Term {
+				tmp_conflict_term := me_logs[prevLogIndex].Term
+				reply.ConflictIndex = prevLogIndex
+				for reply.ConflictIndex >= 0 && me_logs[reply.ConflictIndex].Term < tmp_conflict_term {
+					reply.ConflictIndex -= 1
+				}
+
+				if reply.ConflictIndex >= 0 {
+					reply.ConflictTerm = me_logs[reply.ConflictIndex].Term
+				} else {
+					reply.ConflictTerm = 0
+				}
+
 				logger.Log(logger.DAppend, "S%d <- S%d: Fail, wrong prev log term", leader_id, me)
 				return
 			}
@@ -694,13 +721,13 @@ func (rf *Raft) sendAppendWithTimer(server int, args *AppendEntriesArgs, reply *
 
 }
 
-func (rf *Raft) setupAppendRoutine() {
-	rf.appendChan = make(chan bool)
+func (rf *Raft) setupAppendRoutines() {
+	rf.appendSignal = make(chan bool)
 	reply_chan := make(chan bool, len(rf.peers)-1)
 	me := rf.me
 
 	go func() {
-		for <-rf.appendChan {
+		for <-rf.appendSignal && !rf.killed() {
 			logs := rf.getLog()
 			rf_int_metadata := rf.getInt(rfGetCurTerm(), rfGetCommID())
 			cur_term := rf_int_metadata[0]
@@ -708,7 +735,6 @@ func (rf *Raft) setupAppendRoutine() {
 			rf_arr_metadata := rf.getArr(rfGetNextID(), rfGetMatchID())
 			nextIDs := rf_arr_metadata[0]
 			matchIDs := rf_arr_metadata[1]
-			logger.Log(logger.DAppend, "S%d: match id %v", me, matchIDs)
 
 			for i := range rf.peers {
 				if i == me {
@@ -731,37 +757,28 @@ func (rf *Raft) setupAppendRoutine() {
 						PrevLogIndex: lastID,
 						PrevLogTerm:  last_term,
 					}
-					if matchIDs[peerID] > -2 {
-						args.LeaderCommit = commID
-						if len(logs) > nextIDs[peerID] {
-							args.Entries = logs[nextIDs[peerID]:]
 
-							if len(args.Entries) > MAX_LOG_LEN {
-								args.Entries = args.Entries[:MAX_LOG_LEN]
-							}
-
-							logger.Log(logger.DAppend, "S%d: send to S%d from id %d", me, peerID, nextIDs[peerID])
-						}
-					} else {
-						args.LeaderCommit = -1
+					args.LeaderCommit = commID
+					if len(logs) > nextIDs[peerID] {
+						args.Entries = logs[nextIDs[peerID]:]
+						logger.Log(logger.DAppend, "S%d: send to S%d from id %d", me, peerID, nextIDs[peerID])
 					}
 					reply := AppendEntriesReply{}
 
 					ok := rf.sendAppendWithTimer(peerID, &args, &reply)
 					if ok {
 						if reply.Success {
-							if matchIDs[peerID] <= -2 {
-								rf.update(rfUpdateMatchID(peerID, lastID))
-								logger.Log(logger.DAppend, "S%d: match S%d", me, peerID)
-							} else {
-								rf.update(rfUpdateMatchID(peerID, nextIDs[peerID]+len(args.Entries)-1), rfUpdateNextID(peerID, nextIDs[peerID]+len(args.Entries)))
-								logger.Log(logger.DAppend, "S%d: update S%d next id to %d", me, peerID, nextIDs[peerID]+len(args.Entries))
-							}
+							rf.update(rfUpdateMatchID(peerID, nextIDs[peerID]+len(args.Entries)-1), rfUpdateNextID(peerID, nextIDs[peerID]+len(args.Entries)))
+							matchIDs[peerID] = nextIDs[peerID] + len(args.Entries) - 1
+							logger.Log(logger.DAppend, "S%d: update S%d next id to %d", me, peerID, nextIDs[peerID]+len(args.Entries))
 						} else if reply.Term <= cur_term {
+							for logs[lastID].Term >= reply.ConflictTerm && lastID > 0 {
+								lastID -= 1
+							}
+							logger.Log(logger.DAppend, "S%d: fail to update S%d, reply with %v, next id %d, log %v", me, peerID, reply, lastID, logs)
 							rf.update(rfUpdateNextID(peerID, lastID))
-							logger.Log(logger.DAppend, "S%d: fail to update S%d, set next id %d", me, peerID, lastID)
 						} else {
-							rf.update(rfUpdateState(FOLLOWER), rfUpdateCurTerm(reply.Term))
+							rf.update(rfUpdateState(FOLLOWER, reply.Term), rfUpdateCurTerm(reply.Term))
 						}
 						reply_chan <- reply.Success
 					} else {
@@ -770,6 +787,7 @@ func (rf *Raft) setupAppendRoutine() {
 				}()
 			}
 
+			rf.update(rfUpdateTimer())
 			for range len(rf.peers) - 1 {
 				<-reply_chan
 			}
@@ -792,16 +810,17 @@ func (rf *Raft) setupAppendRoutine() {
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.start_mu.Lock()
-	defer rf.start_mu.Unlock()
 	rf_metadata := rf.getInt(rfGetLogLen(), rfGetCurTerm(), rfGetState())
 	commID := rf_metadata[0]
 	cur_term := rf_metadata[1]
 	isLeader := rf_metadata[2] == LEADER
 
-	if isLeader {
+	if isLeader && !rf.killed() {
 		logger.Log(logger.DServe, "S%d: get start service call", rf.me)
 		rf.update(rfUpdateOneLog(LogEntry{Command: command, Term: cur_term}))
 	}
+
+	rf.start_mu.Unlock()
 	return commID + 1, cur_term, isLeader
 }
 
@@ -836,16 +855,14 @@ func (rf *Raft) ticker() {
 			_, is_leader := rf.GetState()
 			if !is_leader {
 				logger.Log(logger.DInfo, "S%d: haven't recived append entries, become candidator", me)
-				rf.voteChan <- true
-				is_leader = <-rf.voteChan
+				rf.voteSignal <- true
+				is_leader = <-rf.voteSignal
 			}
 
 			if is_leader {
 				logger.Log(logger.DLeader, "S%d: Start send append entries", me)
-				rf.appendChan <- true
+				rf.appendSignal <- true
 			}
-
-			rf.update(rfUpdateTimer())
 		} else {
 			time.Sleep(TICKER_INTER)
 		}
@@ -863,11 +880,12 @@ func (rf *Raft) ticker() {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{timer: time.NewTimer(time.Duration(1) * time.Millisecond)}
+	rf := &Raft{timer: time.NewTimer(time.Duration(10*me) * time.Millisecond)}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.apply_chan = applyCh
+	rf.applyChan = applyCh
+	rf.commitChan = make(chan ApplyMsg, 10)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.State = FOLLOWER
@@ -889,7 +907,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	rf.setupVoteRoutines()
-	rf.setupAppendRoutine()
+	rf.setupAppendRoutines()
+	rf.setupCommitRoutine()
 	go rf.ticker()
 	logger.Log(logger.DServe, "S%d: started", rf.me)
 
